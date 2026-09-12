@@ -45,6 +45,7 @@ _None open. The "last character not saved when switching files" issue (on hold s
 - [x] Interactive task-list checkboxes, GFM table styling, Cmd+B / Cmd+I
 - [x] Cloud-sync friendliness: hash-guarded writes, fsync, direct overwrite, junk-file filter
 - [x] Tag Manager (⌘⇧T)
+- [x] Live preview polish (2026-09-12): heading text flush with body text, hanging indents for wrapped list items and block quotes
 - [x] **Audit fixes, September 2026** — see [AUDIT-2026-09.md](AUDIT-2026-09.md) for the findings; in short:
   - Data safety: edit-version save guard (fixes the lost-keystroke bug), failed saves surface in the status bar and keep the note dirty, per-document editor instances (no cross-note undo), renames refuse to overwrite, deletes go to the Trash, conflict copies when a note changed on disk, flush before every destructive operation, last opened note reopens on launch.
   - Tag propagation: protected ranges apply on both sides, only new tags propagate, never the tag under the caret, automatic snapshots in their own ring so manual ones are never evicted, mentions ignore code/links.

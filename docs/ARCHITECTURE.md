@@ -146,7 +146,7 @@ CSS custom properties in `globals.css`; dark is the default and `.light` on the 
 
 ## Editor
 
-CodeMirror 6 with markdown support, a custom theme, and extensions for mark hiding on inactive lines, inline images, tag highlighting (same rules as the index, skipping headings and code), task-list checkboxes, GFM table styling, link clicks (Cmd/Ctrl-click), and Cmd+B / Cmd+I. Autosave is 2.5 s after the last keystroke with eager flushes on blur, hide, quit, Cmd+S, and every note switch.
+CodeMirror 6 with markdown support, a custom theme, and extensions for mark hiding on inactive lines (the space after a heading's `#` is hidden with it), hanging indents for list items and block quotes (the marker prefix is measured in the editor font via canvas `measureText` and applied as `padding-left` plus negative `text-indent`), inline images, tag highlighting (same rules as the index, skipping headings and code), task-list checkboxes, GFM table styling, link clicks (Cmd/Ctrl-click), and Cmd+B / Cmd+I. Autosave is 2.5 s after the last keystroke with eager flushes on blur, hide, quit, Cmd+S, and every note switch.
 
 ## Security posture
 

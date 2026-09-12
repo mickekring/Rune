@@ -1,7 +1,7 @@
 {
   "name": "rune",
   "productName": "Rune",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local-first markdown workspace with tags, history, and on-device AI chat",
   "main": "./out/main/index.js",
   "scripts": {

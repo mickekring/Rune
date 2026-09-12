@@ -25,6 +25,7 @@ import { tagHighlight } from './tagHighlight'
 import { taskList } from './taskList'
 import { tableStyling } from './tableStyling'
 import { markdownShortcuts } from './markdownShortcuts'
+import { listIndent } from './listIndent'
 
 interface UseCodeMirrorOptions {
   initialValue: string
@@ -83,6 +84,7 @@ export function useCodeMirror({ initialValue, onChange, onCursorChange }: UseCod
           tagHighlight,
           taskList,
           tableStyling,
+          listIndent,
           linkClicks,
           imageWidgetClicks,
           syntaxHighlighting(defaultHighlightStyle, { fallback: true }),

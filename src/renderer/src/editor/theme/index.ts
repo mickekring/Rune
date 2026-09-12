@@ -7,6 +7,7 @@ import { tags as t } from '@lezer/highlight'
 // properties so they're actually applied by CodeMirror's highlighter.
 export const editorTheme = EditorView.theme({
   '&': {
+    '--editor-line-padding': '2.5rem',
     height: '100%',
     fontSize: 'var(--editor-font-size, 16px)',
     fontFamily: 'var(--font-sans)',
@@ -51,7 +52,7 @@ export const editorTheme = EditorView.theme({
     fontFamily: 'inherit'
   },
   '.cm-line': {
-    padding: '0 2.5rem'
+    padding: '0 var(--editor-line-padding)'
   },
   '.cm-placeholder': {
     color: 'var(--color-muted-foreground)',
