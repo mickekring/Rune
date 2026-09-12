@@ -367,3 +367,27 @@ body {
   outline: 2px solid var(--color-primary);
   outline-offset: 2px;
 }
+
+/* YAML frontmatter at the top of a note renders as a quiet metadata block
+   (the parser extension in editor/frontmatterParser.ts keeps it out of
+   the markdown structure; editor/frontmatter.ts tags the lines). The
+   selectors carry .cm-editor so they outrank the injected editor theme. */
+.cm-editor .cm-line.cm-frontmatter {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  line-height: 1.7;
+  color: var(--color-muted-foreground);
+  background: color-mix(in srgb, var(--color-muted) 45%, transparent);
+}
+
+.cm-editor .cm-line.cm-frontmatter-first {
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+  padding-top: 0.45em;
+}
+
+.cm-editor .cm-line.cm-frontmatter-last {
+  border-bottom-left-radius: 8px;
+  border-bottom-right-radius: 8px;
+  padding-bottom: 0.45em;
+}

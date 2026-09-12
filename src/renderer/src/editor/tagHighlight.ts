@@ -25,7 +25,8 @@ const SKIP_NODES = new Set([
   'CodeBlock',
   'InlineCode',
   'URL',
-  'Autolink'
+  'Autolink',
+  'Frontmatter'
 ])
 
 const tagMark = Decoration.mark({ class: 'cm-tag' })

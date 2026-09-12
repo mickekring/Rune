@@ -26,6 +26,8 @@ import { taskList } from './taskList'
 import { tableStyling } from './tableStyling'
 import { markdownShortcuts } from './markdownShortcuts'
 import { listIndent } from './listIndent'
+import { frontmatterBlock } from './frontmatter'
+import { frontmatter } from './frontmatterParser'
 
 interface UseCodeMirrorOptions {
   initialValue: string
@@ -77,8 +79,9 @@ export function useCodeMirror({ initialValue, onChange, onCursorChange }: UseCod
             ...closeBracketsKeymap,
             indentWithTab
           ]),
-          markdown({ base: markdownLanguage, codeLanguages: languages }),
+          markdown({ base: markdownLanguage, codeLanguages: languages, extensions: [frontmatter] }),
           ...theme,
+          frontmatterBlock,
           hideMarkdownMarks,
           inlineImages,
           tagHighlight,

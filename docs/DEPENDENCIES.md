@@ -28,6 +28,7 @@ Check the bundled versions with `ELECTRON_RUN_AS_NODE=1 ./node_modules/.bin/elec
 | @codemirror/state | ^6.7.4 | 6.7.4 | Editor state |
 | @codemirror/view | ^6.43.11 | 6.43.11 | Editor view / DOM layer |
 | @lezer/highlight | ^1.2.3 | 1.2.3 | Highlight tags for the theme |
+| @lezer/markdown | ^1.7.2 | 1.7.2 | Parser extension API (frontmatter block) |
 | react-markdown | ^10.1.0 | 10.1.0 | Markdown rendering in AI chat bubbles |
 | remark-gfm | ^4.0.1 | 4.0.1 | GFM extensions for react-markdown |
 | d3-force | ^3.0.0 | 3.0.0 | Force-directed layout for the Tag Constellation |
@@ -81,5 +82,5 @@ npm run typecheck && npm run lint && npm test && npx electron-vite build
 - **Electron pins the Chromium + Node runtime** bundled in the packaged app; `@types/node` follows Electron's Node major.
 - **CodeMirror packages should update together** — they share internal versioning and mismatches cause subtle bugs.
 - **Tailwind CSS 4** uses the `@theme` directive and the official `@tailwindcss/vite` plugin (no PostCSS config).
-- **Removed in the audit pass**: `@lezer/markdown` as a direct dependency (only ever used transitively through `@codemirror/lang-markdown`), plus the pnpm leftovers (`pnpm-workspace.yaml`, `.npmrc`) that made npm warn on every command.
+- **Removed in the audit pass**: the pnpm leftovers (`pnpm-workspace.yaml`, `.npmrc`) that made npm warn on every command.
 - **Electron is a devDependency by convention**, so `npm audit --omit=dev` does not cover it. Always audit with the full tree.

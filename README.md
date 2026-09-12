@@ -16,8 +16,9 @@ Built with Electron, React, TypeScript, and CodeMirror 6.
 - **Live markdown preview** — headings, bold, italic, links, and inline
   images render as you type. The raw `#`, `**`, `[…](…)` marks hide on
   inactive lines and reappear when you click in to edit, like Obsidian.
-  Headings sit flush with body text, and wrapped list items and quotes
-  keep a hanging indent aligned with the text after the marker.
+  Headings sit flush with body text, wrapped list items and quotes keep
+  a hanging indent aligned with the text after the marker, and YAML
+  frontmatter at the top of a note renders as a quiet metadata block.
 - **Task lists & tables** — GFM `- [ ]` / `- [x]` render as clickable
   checkboxes; pipe tables get monospaced columns with dimmed delimiters
   so they read as tables while staying plain-text editable.
