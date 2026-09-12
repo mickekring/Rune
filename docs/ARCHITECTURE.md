@@ -7,274 +7,153 @@ Rune is a local-first, single-vault Electron desktop app for markdown notes. All
 ## Process Model
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Main Process (Node.js)                             │
-│                                                     │
-│  ┌──────────┐  ┌──────────────┐  ┌───────────────┐ │
-│  │ Zustand   │  │ Settings     │  │ IPC Handlers  │ │
-│  │ Store     │  │ Service      │  │               │ │
-│  │ (author-  │  │ (~/.arbets-  │  │ file:*        │ │
-│  │  itative) │  │   yta/)      │  │ folder:*      │ │
-│  └──────────┘  └──────────────┘  │ vault:*       │ │
-│                                   │ dialog:*      │ │
-│                                   │ store:*       │ │
-│                                   └───────────────┘ │
-└────────────────────┬────────────────────────────────┘
-                     │ IPC (contextBridge)
-┌────────────────────┴────────────────────────────────┐
-│  Preload Script                                      │
-│  Exposes: window.api.invoke(), window.api.on()       │
-└────────────────────┬────────────────────────────────┘
-                     │
-┌────────────────────┴────────────────────────────────┐
-│  Renderer Process (React)                            │
-│                                                      │
-│  ┌──────────────┐  ┌───────────────────────────────┐ │
-│  │ React Hooks  │  │ Components                    │ │
-│  │ useStore()   │  │                               │ │
-│  │ useSettings()│  │  AppLayout                    │ │
-│  │ useFileTree()│  │  ├── LeftSidebar (file tree)  │ │
-│  │ useUI()      │  │  ├── Editor (CodeMirror 6)    │ │
-│  │              │  │  ├── RightSidebar (stats)     │ │
-│  └──────────────┘  │  └── StatusBar                │ │
-│                     └───────────────────────────────┘ │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Main Process (Node.js)                                      │
+│                                                              │
+│  store/          Zustand store: settings, ui, fileTree       │
+│  services/       vault-files, vault-walk, tags, history,     │
+│                  settings, ollama, path-guard                │
+│  ipc/            bridge.ts (typed handle/broadcast)          │
+│                  handlers.ts (every channel)                 │
+│  index.ts        window, app:// + vault-media:// protocols,  │
+│                  navigation + permission guards              │
+└───────────────────────────┬──────────────────────────────────┘
+                            │ IPC, typed by src/shared/ipc.ts
+┌───────────────────────────┴──────────────────────────────────┐
+│  Preload (sandboxed)                                         │
+│  window.api.invoke(channel, ...args)  — allowlist from ipc.ts│
+│  window.api.on(channel, cb)           — allowlist from ipc.ts│
+│  window.api.getFilePath(file)                                │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+┌───────────────────────────┴──────────────────────────────────┐
+│  Renderer (React, sandboxed, CSP)                            │
+│  store/          Zustand mirror of settings/ui/fileTree      │
+│                  + editor status (dirty, saving, cursor…)    │
+│  hooks/          useEditorBuffer (owns the open note)        │
+│                  useVaultActions, useVaultData, useChat …    │
+│  components/     AppLayout ─ LeftSidebar / editor / Right-   │
+│                  Sidebar / StatusBar, modals, ui             │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ## State Management
 
-### Authoritative State (Main Process)
+### Authoritative state (main process)
 
-The main process Zustand store is the single source of truth. It holds:
+| Slice | Persisted | Storage |
+|-------|-----------|---------|
+| `settings` (vault path, theme, font size, accent color, `ai.model`, `ai.systemPrompt`) | Yes | `~/.rune/settings.json` |
+| `ui` (sidebar visibility/widths, expanded folders, per-file expanded relations, section expand state and order, last opened note) | Yes | `~/.rune/ui-state.json` |
+| `fileTree` | No | Rebuilt from disk on vault open and after every mutation |
 
-| Category | Persisted | Storage |
-|----------|-----------|---------|
-| `settings` (vault path, theme, font size, accent color) | Yes | `~/.rune/settings.json` |
-| `ui` (sidebar visibility/widths, last opened file, expanded folders) | Yes | `~/.rune/ui-state.json` |
-| `fileTree` (folder/file structure) | No | Rebuilt from disk on vault open |
-| `editor` (current file, content, dirty flag) | No | In-memory only |
+Writes to `~/.rune/*.json` go through a sibling temp file plus rename (atomic) with mode `0600`. `RUNE_CONFIG_DIR` overrides the directory so a second profile can run alongside the real one.
 
-### Renderer Sync
+### Renderer mirror
 
-1. On mount, renderer calls `store:get-state` IPC to hydrate
-2. Renderer listens to `store:state-changed` events from main
-3. Mutations go through IPC invoke → main store updates → broadcasts to all windows
+`src/renderer/src/store/index.ts` is one Zustand store. `hydrateStore()` subscribes to `store:state-changed` first, then fetches `store:get-state` once. Components read with selectors (`useAppStore((s) => s.settings.theme)`), so a change to one slice re-renders only its subscribers. The store also carries renderer-local **editor status** (`currentFile`, `isDirty`, `isSaving`, cursor, document stats, a status-bar notice) so the status bar and right sidebar update without the App component re-rendering.
 
-### File Content
+### The editor buffer
 
-File content is **never** stored in the global state. It's read from disk on demand via `file:read` and written back via `file:write`. The editor component holds content in local React state.
+`useEditorBuffer` is the only owner of the open note: its path, latest text, dirty flag, edit version, and autosave timer. Text lives in refs; a keystroke updates refs and debounces a stats update, nothing else. Rules:
 
-## IPC Channel Design
+- The CodeMirror view is created once per document and keyed by a `docVersion`, so opening or restoring a note remounts the editor with fresh undo history and never fires a spurious change.
+- `save()` captures the edit version, awaits `file:write`, and clears the dirty flag only if no edit landed in between and the note is still the same one. A failed write keeps the note dirty and shows the error.
+- Every operation that could lose text flushes first: switching notes, creating a note, renaming or moving the open note, changing vault, snapshotting, removing a tag. If the flush fails, the operation does not proceed.
+- `file:external-change` (main rewrote a note during tag propagation or removal) reloads the open note only if it is clean; a dirty buffer always wins.
+- The window's `blur`, `visibilitychange`, and `beforeunload` flush the buffer.
 
-All channels are typed in `src/shared/types/ipc.ts`:
+File content never lives in either store.
 
-```
-dialog:select-vault    → string | null
-file:read/write/create/delete/rename/exists
-folder:create/delete/list
-vault:open/close/init
-store:get-state/set-*
-```
+## IPC contract
 
-Events (main → renderer):
-- `store:state-changed` — partial state updates
-- `file:external-change` — reserved for future file watching
+`src/shared/ipc.ts` defines `InvokeMap` (channel → `args`, `result`) and `EventMap` (event → payload). The runtime channel lists in the same file are checked against the maps with `satisfies`, so a channel cannot exist in the types without being allowlisted, or vice versa. The preload derives its allowlists from those lists; main registers handlers through `handle()` in `ipc/bridge.ts`; the renderer calls through `lib/api.ts`. Mutating channels return `{ ok: true, ... } | { ok: false, error }` and never throw across the boundary.
 
-## Directory Layout
+Channels:
 
-```
-src/
-├── main/                  # Electron main process
-│   ├── index.ts          # App lifecycle, window creation
-│   ├── ipc/handlers.ts   # All IPC channel handlers
-│   ├── services/         # Settings persistence
-│   └── store/            # Zustand vanilla store
-├── preload/              # contextBridge (invoke + on)
-├── renderer/src/         # React app
-│   ├── components/
-│   │   ├── layout/       # AppLayout, sidebars, StatusBar, ResizeHandle
-│   │   ├── editor/       # MarkdownEditor, EditableTitle
-│   │   ├── modals/       # Welcome, Settings, Confirm, Input
-│   │   └── ui/           # ContextMenu
-│   ├── editor/           # CodeMirror hook + theme
-│   ├── hooks/            # Store access hooks
-│   └── styles/           # Tailwind + CSS custom properties
-└── shared/types/         # Types shared across processes
-```
+- `dialog:select-vault`, `vault:open` — the dialog result is remembered in main; `vault:open` only accepts roots that came from the dialog or the persisted settings, realpath-resolves them, and refuses `/`, the home folder, top-level folders, and volume roots.
+- `file:read|write|create|delete|rename`, `folder:create|delete` — every path is confined to the vault (`path-guard.ts`). Deletes go to the OS Trash. Renames refuse to overwrite an existing target (case-only renames of the same file are allowed). Main rebuilds and broadcasts the tree after each mutation.
+- `attachment:save`, `attachment:open`, `shell:open-external`.
+- `store:*` — settings and UI state setters; each broadcasts the changed slice.
+- `tags:get-index|get-relations|get-graph|remove-tag`, `search:query`.
+- `history:list|create-snapshot|restore|delete-snapshot`.
+- `ai:list-models|chat-start|chat-abort`.
+
+Events: `store:state-changed` (partial slices), `file:external-change` (paths main rewrote), `tags:index-changed` (`{ version }` only; consumers fetch what they need), `history:changed`, `ai:chat-chunk|done|error` (chunks are coalesced in main every 40 ms).
 
 ## Persistence Paths
 
 | Path | Purpose |
 |------|---------|
-| `~/.rune/settings.json` | App settings (vault path, theme, font size, accent) |
-| `~/.rune/ui-state.json` | UI state (sidebar visibility/widths, expanded folders, per-file expanded relation tags, globally-expanded right-sidebar sections, last opened file) |
-| `~/.rune/window-state.json` | Electron window bounds (width, height, x, y) |
+| `~/.rune/settings.json` | App settings |
+| `~/.rune/ui-state.json` | UI state |
+| `~/.rune/window-state.json` | Window bounds (validated against connected displays on launch) |
 | `{vault}/.rune/config.json` | Per-vault metadata (version, creation date) |
-| `{vault}/**/*.md` | User markdown files |
-| `{vault}/vault_media/` | Attachments (images, PDFs, etc.) dropped into notes. Auto-created on first drop. |
-| `{vault}/.rune/history/{relative-path}/{id}.md` | Manual history snapshots (up to 10 per file). Created via the History section in the right sidebar. Older ones pruned automatically. |
+| `{vault}/**/*.md` | User notes |
+| `{vault}/vault_media/` | Attachments dropped into notes |
+| `{vault}/.rune/history/{relative-path}/{id}.md` | Snapshots; `id` is a timestamp, with an `-auto` suffix for automatic ones |
+| `{note} (conflict YYYY-MM-DD HH.mm).md` | The on-disk version preserved when a save found the note changed externally |
 
-## Attachments
+## Vault files (`vault-files.ts`)
 
-When a file is dragged from the OS into the editor area:
+- **Hash-guarded writes**: a write whose content already matches the disk is skipped.
+- **fsync before close**, **direct overwrite** (no temp-plus-rename, which breaks iCloud and pCloud).
+- **Change tracking**: the mtime/size seen at the last read or write is remembered per path. An editor save (`file:write`) that finds the file changed underneath it writes the on-disk version to a conflict copy next to the note, then writes the editor's content. Internal rewrites (propagation, tag removal) do not conflict-check because they operate on freshly indexed content.
+- The tree walker (`vault-walk.ts`) uses `withFileTypes`, skips symlinks, dotfiles, and sync junk (`~$*`, `*.crdownload`, `*.part`, `*.tmp`), lists non-markdown files only under `vault_media/`, and never stats per file.
 
-1. The renderer reads `file.path` (Electron's extension on the `File` API for OS drops).
-2. It calls the `attachment:save` IPC channel.
-3. The main process ensures `{vault}/vault_media/` exists, copies the source file there with collision-safe renaming (`name-1.ext`, `name-2.ext`, ...), and returns the relative path.
-4. The renderer inserts `![name](vault_media/...)` for images or `[name](vault_media/...)` for other files at the cursor position.
+## Tag engine
 
-## Tag index
+`src/shared/tag-core.ts` (pure, shared with the editor highlighter):
 
-An in-memory index on the main process tracks `#tag` declarations across all `.md` files in the vault. Live-updated as files are saved, created, deleted, or renamed (see IPC handlers for `file:*`).
+- Tag recognition: `(?<=^|[^\w#])#((?=[\p{L}\p{N}_-]*\p{L})[\p{L}\p{N}_-]{2,})` — at least 2 characters, at least one letter (no hex colors), Unicode letters (å, ä, ö).
+- **Protected ranges**: YAML frontmatter, fenced code (an unclosed fence protects to end of file), inline code, link destinations, autolinks, bare URLs. Tags are neither recognised nor inserted inside them, and words inside them do not count as mentions.
 
-Data structures (in [src/main/services/tags-service.ts](../src/main/services/tags-service.ts)):
+`tags-service.ts` keeps, per note, the content, a lower-cased copy (search), the tag set, and the protected ranges. Derived views (`getSnapshot`, `getTagGraph`) are memoised per index version.
 
-- `filesByTag: Map<tag, Set<file>>` — which files declare each tag
-- `tagsByFile: Map<file, Set<tag>>` — inverse lookup for fast updates
-- `contentByFile: Map<file, string>` — cached content for weak-match (mention) lookup
-- `displayByTag: Map<lowerTag, origCaseTag>` — preserves the first-seen casing so "NIP" and "nip" show up as whichever was typed first
+### Propagation (auto-tagging)
 
-Matching rules:
+After a changed `file:write` or `file:create`, `propagateTags(path, caretOffset)` inserts `#` before the first unprotected, whole-word, untagged occurrence of each candidate tag in every other note. A tag is a candidate only if:
 
-- Tag recognition: `(?<=^|[^\w#])#([\p{L}\p{N}_-]{2,})` — min 2 chars, not preceded by a word char or another `#`, supports Unicode letters (å, ä, ö).
-- Headings are excluded in the editor highlighter (a `#` at the start of an ATX heading shouldn't look like a tag).
-- "Mentioned" (weak) match: `(?<=^|[^\p{L}\p{N}_])<tag>(?=[^\p{L}\p{N}_]|$)` case-insensitive word-boundary search through cached content.
+- it is at least 3 characters long,
+- it has not propagated from this note before in this session (every tag present when the vault was opened counts as already propagated, so opening a vault never rewrites anything), and
+- the caret is not inside it — the renderer passes the caret offset with every save, so `#the` on the way to `#theory` is never propagated.
 
-IPC channels:
+Each rewritten note gets one automatic snapshot per run before the rewrite, and main broadcasts `file:external-change` so an open, clean note reloads.
 
-- `tags:get-index` — full snapshot of all tags + files that declare each
-- `tags:get-relations(filePath)` — per-file: tags declared + `taggedIn` (strong) + `mentionedIn` (weak) related files
-- `tags:get-graph` — co-occurrence graph used by the Tag Constellation
-- `tags:rescan` — force full vault rescan
-- `tags:remove-tag(tag)` — strip the leading `#` from every occurrence of a tag across the vault, returning `{ filesModified, occurrencesRemoved }`. See **Tag operations** below.
-- Event: `tags:index-changed` broadcast whenever the index mutates
+### Tag removal
 
-### Tag operations
+`removeTag(tag)` strips the leading `#` from every unprotected occurrence across the vault, snapshotting each note first (`auto`). The Tag Manager flushes the editor before invoking it.
 
-The **Tag Manager** modal (`src/renderer/src/components/modals/TagManagerModal.tsx`, opened via ⌘⇧T or the tag icon in the left sidebar header) lists every tag in the vault with note counts and exposes a single bulk operation today: **delete tag**.
+## History (`history-service.ts`)
 
-Deleting a tag does not delete any words. `tagsService.removeTag(tag)` finds every `TAG_REGEX` match across `state.contentByFile` whose lowercased name matches the target, filters out matches that fall inside `findProtectedRanges` (frontmatter, fenced/inline code, link destinations, autolinks, bare URLs), and rewrites each affected file with just the leading `#` byte stripped. So `Visited #Sweden` becomes `Visited Sweden`; the word `Sweden` inside a code block or a URL fragment is left exactly as it was.
+Snapshots are full copies. Ids are timestamps (`2026-04-18T14-23-56-123Z`, `…Z-auto`) and are validated against that exact shape before any path is built from them. `manual` and `auto` kinds are pruned as two separate rings of `HISTORY_MAX_SNAPSHOTS` (10). An automatic snapshot is skipped when the newest snapshot already holds the same content. Snapshot folders follow renames and are removed with their note or folder.
 
-Each modified file gets a `historyService.createSnapshot` *before* the rewrite, so the Tag Manager's destructive action is reversible per-file from the History panel. Writes go through `safeWriteFile` for the usual cloud-sync friendliness (hash guard + fsync + direct overwrite).
+## Attachments and the `vault-media://` scheme
 
-If the file currently open in the editor is one of the rewritten files, `App.tsx` re-reads it via `file:read` and replaces the in-memory content so the user sees the change immediately rather than dirty stale content.
+Dropped files are copied into `{vault}/vault_media/` with collision-safe names (symlinks and non-regular files are refused). Images render through `vault-media://local/<path>`; the handler resolves the decoded path against `vault_media/`, realpath-resolves it, and refuses anything that escapes. `attachment:open` accepts vault-relative paths only, confines them to the vault, hands only known document/image/media extensions to `shell.openPath`, and reveals anything else in the file manager.
+
+## The `app://` scheme
+
+In packaged builds the renderer is served from `out/renderer` over `app://rune/` (confined to that directory, with the full CSP attached as a response header). A real origin makes the `will-navigate` guard meaningful — `file://` pages all share the opaque `null` origin — and lets the `GrantFileProtocolExtraPrivileges` fuse be disabled. In development the Vite dev server URL is used instead.
 
 ## AI chat (Ollama)
 
-The right sidebar contains an **AI Chat** section that talks to a locally-running [Ollama](https://ollama.com) instance at `http://localhost:11434` (hard-coded for now).
-
-Main process (`src/main/services/ollama-service.ts`) exposes two operations:
-
-- `listModels()` — GET `/api/tags`, returns installed models or a friendly error if Ollama isn't running.
-- `streamChat(model, messages, signal, onDelta, onDone, onError)` — POST `/api/chat` with `stream: true`, parses newline-delimited JSON, and invokes the callbacks per chunk/done/error. Cancellation via `AbortSignal`.
-
-IPC channels:
-
-- `ai:list-models` — returns `{ ok, models }` / `{ ok: false, error }`
-- `ai:chat-start(requestId, model, messages)` — fire-and-forget; streams results via events
-- `ai:chat-abort(requestId)` — cancels an in-flight stream
-
-Renderer events:
-
-- `ai:chat-chunk { requestId, delta }` — token stream
-- `ai:chat-done { requestId }` — stream completed
-- `ai:chat-error { requestId, message }` — stream failed
-
-The `useChat` hook in `src/renderer/src/hooks/useChat.ts` tracks messages, the streaming flag, and an abort handle. Chat state resets whenever the current file changes.
-
-Settings (`settings.ai`):
-
-- `model` — selected Ollama model name
-- `systemPrompt` — template with a `{{document}}` placeholder substituted with the current note at send time
-
-### Tag propagation (auto-tagging)
-
-When a file is saved via `file:write` or created via `file:create`, `tagsService.propagateTags(path)` runs. For every tag declared in the saved file (min 3 characters), the service walks other indexed files and **inserts a `#` before the first untagged occurrence of the tag word**, then rewrites that file to disk and updates its index entry.
-
-Rules:
-
-- **File must not already contain the tag** — if `#Tag` exists anywhere in the target file, it's left untouched.
-- **First occurrence only** — subsequent mentions in the same file are not modified.
-- **Word-boundary match** — `(?<=^|[^\p{L}\p{N}_#])Tag(?=[^\p{L}\p{N}_]|$)` case-insensitive, so `NIPS` or `snipping` won't match `NIP`.
-- **Minimum 3 characters** for propagation. Short tags like `#OR` are recognized locally but skipped during propagation to avoid mass false-positives.
-- **Source file is excluded** from propagation — we're tagging other files, not re-tagging the one that declared the tag.
-
-A single `tags:index-changed` broadcast is emitted after propagation finishes so the renderer refreshes once, not per file.
-
-### Loading images in the renderer
-
-Images reference `vault_media/filename.ext` in markdown, but the renderer can't load `file://` URLs directly (cross-origin with the `http://localhost:5173` dev server, same-origin issues in production). A custom `vault-media://` protocol is registered in `src/main/index.ts`:
-
-- Scheme is registered as privileged *before* `app.whenReady()` (required by Electron).
-- The handler resolves `vault-media://local/...` requests against `{currentVaultPath}/vault_media/` and streams the file back via `net.fetch(file://...)`.
-- The CodeMirror inline image widget uses `vault-media://local/filename.ext` as the `<img src>`.
+`ollama-service.ts` talks to `http://localhost:11434` (`OLLAMA_BASE_URL`, not yet configurable): `listModels()` with a 3 s timeout, `streamChat()` with per-request abort, a 60 s stall timeout, and a bounded line buffer. Handlers cap concurrent streams at 5, reject duplicate request ids, and coalesce deltas into 40 ms batches. `useChat` lives inside `AIChatSection` (which stays mounted while collapsed) and reads the note text at send time. Model output is rendered with react-markdown; only `http(s)`/`mailto` links survive and they open in the default browser.
 
 ## Theme System
 
-Theming is handled via CSS custom properties defined in `globals.css`. Dark mode is the default. Light mode is toggled by adding a `.light` class to the document root. The theme preference is persisted in settings.
-
-Accent color (10 presets) and font size (5 levels) are also stored in settings and applied via CSS variables.
+CSS custom properties in `globals.css`; dark is the default and `.light` on the root element switches palettes. `useThemeEffects` applies theme, accent color, and font size (`--font-size-base`, `--editor-font-size`, and the root `font-size` so rem-based sizing scales).
 
 ## Editor
 
-The editor uses CodeMirror 6 with:
-- Markdown language support with syntax highlighting
-- Custom theme matching app CSS variables
-- Auto-save (2.5-second debounce after changes) + eager flush on blur / visibilitychange / beforeunload / Cmd+S / file-switch
-- Manual save (Cmd+S)
-- Cursor position tracking (reported to StatusBar)
-- Interactive task-list checkboxes (`- [ ]` / `- [x]`), GFM table styling, and Cmd+B / Cmd+I markdown shortcuts
+CodeMirror 6 with markdown support, a custom theme, and extensions for mark hiding on inactive lines, inline images, tag highlighting (same rules as the index, skipping headings and code), task-list checkboxes, GFM table styling, link clicks (Cmd/Ctrl-click), and Cmd+B / Cmd+I. Autosave is 2.5 s after the last keystroke with eager flushes on blur, hide, quit, Cmd+S, and every note switch.
 
-## Cloud-sync friendliness
+## Security posture
 
-Rune's storage is plain files in a user-chosen folder, so users put their vault inside pCloud / OneDrive / iCloud / Proton Drive / Dropbox / Syncthing and expect it to Just Work. Several small choices in the write path keep conflicts rare:
-
-- **Hash-guarded writes** (`src/main/services/safe-write.ts`, `safeWriteFile`): before writing a vault file we read its current contents and skip the write entirely if the bytes match. This kills the biggest cause of conflict copies — repeated "save" calls that don't actually change anything (autosave firing on no-op keystrokes, tag-propagation re-running, snapshot restore of identical content). Every skipped write is one fewer race window for the sync daemon.
-- **Direct overwrite, never rename-over-temp**: the classic "safe write" pattern (write to `foo.md.tmp`, rename over `foo.md`) breaks badly with iCloud (rewrites inodes) and pCloud (treats rename as delete+create, producing duplicate uploads). Rune opens the target file directly, writes, fsyncs, and closes.
-- **fsync before close**: once we release the file descriptor, FSEvents-driven sync daemons read the file immediately. fsync ensures stable bytes on disk before that happens; without it the daemon can briefly observe a partially-written file.
-- **Longer autosave debounce (2.5s)**: fewer writes per minute means fewer chances to race a sync upload. The editor still flushes eagerly on any focus-loss / navigation event, so worst-case data loss on crash is ≤2.5s of typing.
-- **Junk-file filtering** (`src/main/ipc/handlers.ts`, `JUNK_FILENAME_PATTERNS`): in addition to the existing `.`-prefix skip (which catches `.DS_Store`, iCloud `.Name.md.icloud` placeholders, Syncthing `.sync-conflict-*`, LibreOffice `.~lock.*#`), we also skip `~$*` (Office lock files) and `*.crdownload` / `*.part` / `*.tmp` / `*.temp` so transient sync artifacts don't clutter the file tree.
-
-Still to come (Layer 2+): external-change detection via `chokidar` with mtime/hash tracking so we reload clean files silently and warn on dirty ones; a first-class "Conflicts" section that groups detected `(conflicted copy)` / `.sync-conflict-*` siblings with compare/merge actions.
-
-## Security
-
-A full security audit ran in April 2026 (see `tasks/lessons.md`). The current posture:
-
-**Renderer isolation:**
-
-- `contextIsolation: true` — renderer runs in a separate JS world; cannot touch Node.
-- `nodeIntegration: false` — no `require()` in the renderer.
-- `sandbox: true` — Chromium OS-level sandbox for the renderer process.
-- `webviewTag: false` — `<webview>` blocked.
-
-**IPC bridge (`src/preload/index.ts`):**
-
-- Generic `invoke` / `on` still exists, but an **explicit allowlist** (`ALLOWED_INVOKE_CHANNELS`, `ALLOWED_EVENT_CHANNELS`) rejects any channel not in the list. A compromised renderer cannot reach an IPC channel we didn't intend to expose.
-
-**Path confinement (`src/main/services/path-guard.ts`):**
-
-- `assertInsideVault(p)` / `safeInsideVault(p)` — realpath-resolves a renderer-supplied path and rejects anything outside the current vault root. Applied to every `file:*`, `folder:*`, `attachment:*`, and `history:*` IPC handler.
-- `attachment:open` additionally rejects absolute paths outright (so crafted links like `[x](/Applications/Evil.app)` can't launch anything).
-
-**Custom protocol (`vault-media://`):**
-
-- Re-resolves the decoded path against `{vault}/vault_media/` and returns `403 Forbidden` if the result escapes — defeats percent-encoded `..` traversal (e.g. `%2F..%2F..%2Fetc%2Fpasswd`).
-
-**URL handling:**
-
-- `isSafeExternalUrl` allowlists `http:`, `https:`, `mailto:` only. Used by `shell:open-external`, the window-open handler, and the `will-navigate` guard.
-
-**Tag propagation:**
-
-- `propagateTags()` detects protected byte-ranges (YAML frontmatter, fenced code, inline code, link destinations, autolinks, bare URLs) and skips matches inside them. Takes a history snapshot of every target file before writing, so restore is always available.
-
-**Dependency hygiene:**
-
-- `npm audit` = 0 vulnerabilities (876 resolved packages).
-- No unexpected postinstall scripts.
-- Unused deps removed (`clsx`, `chokidar`, `date-fns`, `@electron-toolkit/utils`, `@electron-toolkit/preload`).
-
-**Single-instance lock** prevents multiple app windows (side-effect caveat: a packaged Rune.app running can silently block `npm run dev` from starting a second instance).
-
-**External links** open in the default browser, never in-app.
+- Renderer: `sandbox`, `contextIsolation`, no `nodeIntegration`, `webviewTag: false`, `will-attach-webview` blocked, deny-all permission handlers, `setWindowOpenHandler` denies everything (safe URLs go to the browser).
+- Navigation: only the app's own URL is allowed; anything else is blocked and, if `http(s)`/`mailto`, opened externally.
+- CSP: `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: vault-media:; object-src 'none'; base-uri 'self'; form-action 'none'` plus `frame-ancestors 'none'` in the header.
+- IPC: allowlists derived from the contract; every path argument confined to the vault through realpath; snapshot ids validated; vault roots restricted to dialog-chosen folders.
+- Symlinks are skipped by the walker and rejected by the guard, so a synced vault cannot point the indexer or propagation outside itself.
+- Packaged builds: Electron fuses disable `RunAsNode`, `NODE_OPTIONS`, `--inspect`, and file-protocol privileges, enable asar integrity validation and cookie encryption; the hardened runtime keeps only `allow-jit`; `app.asar` contains just `out/` and `package.json`.
+- `~/.rune/*.json` are written atomically with mode `0600`.

@@ -2,101 +2,65 @@
 
 ## Known Issues
 
-### Last character not saved when switching files
-**Status:** On hold
-**Priority:** High
+_None open. The "last character not saved when switching files" issue (on hold since April) was traced to `handleSave` clearing the dirty flag after an async write even when keystrokes had arrived in the meantime; the editor buffer now uses an edit-version guard. See [AUDIT-2026-09.md](AUDIT-2026-09.md)._
 
-When typing in the editor and immediately clicking on another file, the last typed character is sometimes lost.
+## In progress / decisions pending
 
-**Observed behavior:**
-- Typing "a" alone → saves correctly
-- Typing "ab" → only "a" is saved (loses "b")
-- Adding a space or newline after the last character → saves correctly
-
-**Attempted fixes (none worked):**
-1. Using refs to track content synchronously
-2. Reading directly from CodeMirror via `forwardRef`/`useImperativeHandle`
-3. Calling `view.observer.flush()` before reading state
-4. Adding `setTimeout(0)` to defer file switch
-
-**Root cause hypothesis:**
-The issue appears to be timing-related between CodeMirror's DOM observation and when we read the state. The last keystroke may not have been processed by CodeMirror's MutationObserver when the click event triggers the file switch.
-
-**Potential solutions to explore:**
-- Listen to `beforeinput` events to capture pending input
-- Use `requestAnimationFrame` instead of `setTimeout`
-- Add a blur handler that saves before focus leaves
-- Investigate CodeMirror's composition handling
-
-**Possibly related fix landed** (2026-04-12): the auto-save debounce was firing against a stale `handleSave` closure, so the first keystroke after any save/open was silently dropped. `handleSave` is now ref-based (stable) and `MarkdownEditor` mirrors `onSave` into a ref. Worth re-testing the file-switch scenario — some of the reported lost-character cases may actually have been caused by the stale-closure path rather than the MutationObserver timing.
-
----
+- **Distribution signing** — builds are signed with an Apple Development identity and not notarized, so other Macs reject the DMG. Needs a Developer ID certificate and `notarize: true` with credentials in the environment.
+- **App id** — `com.rune.app` is not a domain we control. Changing it resets TCC grants and the single-instance identity, so decide before a public release.
+- **Major dependency upgrades** — Electron 44, Vite 8 (needs electron-vite support), TypeScript 7, ESLint 10 are available but were not taken in the audit pass. Bump deliberately, one at a time.
 
 ## Completed
 
 - [x] Project scaffolding with electron-vite
 - [x] Store & persistence layer (Zustand)
-- [x] IPC type system
 - [x] Theme system + three-panel layout
 - [x] Vault selection & file tree
 - [x] CodeMirror 6 markdown editor
 - [x] Document stats (word count, reading time)
 - [x] Welcome modal for first-time vault selection
-- [x] File tree with collapsible folders
-- [x] Resizable sidebars
-- [x] Dark/light theme toggle (persisted)
-- [x] Auto-save with 1s debounce
-- [x] Manual save with Cmd+S
-- [x] New note creation
-- [x] New folder creation (with InputModal)
-- [x] Single instance lock (prevent multiple Electron windows)
-- [x] System fonts (removed Google Fonts for offline support)
-- [x] File tree loads on startup
-- [x] Persisted folder expand/collapse state across restarts
-- [x] Documentation folder (`docs/`) with ARCHITECTURE, DEPENDENCIES, TODO
-- [x] Inline markdown rendering — hide marks on inactive lines (Obsidian-style live preview)
-- [x] Folder context menu: "New Note" and "New Folder" targeting the clicked folder
-- [x] Drag-and-drop attachments into the editor — copies files to `{vault}/vault_media/` and inserts markdown link/image syntax
-- [x] Inline image rendering via custom `vault-media://` protocol + CodeMirror widget decorations
-- [x] Dedicated "Media files" section in the left sidebar (separated from regular notes)
-- [x] Fix stale-closure bug where first keystroke after save wasn't auto-saved (ref-based `handleSave`)
-- [x] Save eagerly on window blur / visibility hidden as extra data-loss insurance
-- [x] Right sidebar parity with left: same 200–400px resize range, nearly-black background, visible by default
-- [x] Sidebar toggle icons in the status bar (both left and right), state persists
-- [x] Window size + on-screen position persisted to `~/.rune/window-state.json`
-- [x] Increase editor + title horizontal padding so text has breathing room when sidebars are at max
-- [x] Fix sidebar widths reverting to default on Cmd+R reload (sync local state to store after IPC hydration)
-- [x] Full `npm audit` pass — Electron 41, React 19, TS 6; 0 vulnerabilities (was 24)
-- [x] Hashtag-based internal linking — `#tag` in editor styled as clickable, in-memory tag index on main process tracks declarations + weak (plain-text) mentions across the vault
-- [x] Relations section in right sidebar — per-tag list of "Also tagged" + "Mentioned" related notes, live-updates as files save/create/delete/rename
-- [x] Automatic tag propagation — when a file saved with `#Tag` contains 3+ characters, the service inserts `#` before the first untagged occurrence of the tag word in every other file in the vault (word-boundary, case-insensitive, skips files that already contain the tag anywhere)
-- [x] Per-(file, tag) relation group expand/collapse state persisted so choices survive file switches and restarts (default collapsed)
-- [x] Two top-level collapsible right-sidebar sections — Document Info (default collapsed) + Relations (default expanded); globally-remembered state via `store:set-section-expanded`
-- [x] Tag regex excludes pure-digit tokens — hex colors like `#000000` no longer register as tags
-- [x] Per-file manual history snapshots (max 10, pruned on overflow) with Save / Restore / Delete UI in a new right-sidebar History section; snapshots stored at `{vault}/.rune/history/{path}/{id}.md`
-- [x] Full-text search across vault — magnifying-glass icon in sidebar header + ⌘K shortcut opens an in-sidebar search panel with Filenames / Matches groups, highlighted snippets, click-to-open. Reuses the tag service's content cache so each keystroke is an in-memory lookup.
-- [x] **Security hardening (3-pass audit)** — spawned security-auditor + pentester + dependency-manager agents in parallel; found several Critical issues; closed all of them:
-  - P1 (Critical): Path-traversal fixes — `assertInsideVault`/`safeInsideVault` guard on every `file:*`, `folder:*`, `attachment:*`, and `history:*` IPC handler. `vault-media://` protocol resolves against `vault_media/` root with explicit prefix check. `shell:open-external` allowlists http/https/mailto only. `attachment:open` rejects absolute paths.
-  - P2 (High): Preload channel allowlist (renderer can no longer reach arbitrary IPC channels). `propagateTags` now detects protected ranges (code fences, inline code, link destinations, frontmatter, URLs) and skips matches inside them; also snapshots every target file before writing so restore is always possible. `attachment:save` rejects symlinks + non-regular files + uses `path.basename` for cross-platform correctness.
-  - P3 (Defense-in-depth): Tightened CSP (`object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'none'`). Enabled `sandbox: true` + `webviewTag: false`. Added `will-navigate` guard. Concurrency cap on `ai:chat-start`. Removed unused camera/mic entitlements + placeholder publish URL + unused `clsx` dep.
-- [x] **Tag Constellation** — ⌘⇧G opens a force-directed graph of every tag in the vault. Nodes sized by note count, edges between tags that co-occur in at least one note, edge thickness = shared-notes count. Hover to highlight connections; click a tag to open a side drawer listing its notes; click a note to jump there. Uses `d3-force` for layout, pure-SVG rendering with drag + pan + zoom.
-- [x] Fix LeftSidebar hook-order crash when collapsing (rules of hooks violation — guard between hooks)
-- [x] Local AI chat via Ollama — new AI Chat section in the right sidebar streams responses from a local Ollama model; system prompt injects the current document via `{{document}}`; model + prompt editable in Settings → AI; cancel / clear / error-handled
-- [x] Markdown rendering in chat bubbles via react-markdown + remark-gfm (bold, italic, lists, code, tables, etc.)
-- [x] Right sidebar font-size audit — replaced pixel literals (`text-[10px]`, `text-[11px]`) with rem-based Tailwind classes so the Settings → Appearance font-size scales the whole sidebar consistently. Primary content (chat messages, file lists, snapshot rows, "Save snapshot" button) bumped from `text-xs` to `text-sm` for readability.
-- [x] Reorderable right-sidebar sections — each section (Document Info, Relations, History, AI Chat) now has a drag handle in its header; drop onto another section to insert before it. Order persists globally in `ui-state.json` via a new `store:set-section-order` IPC channel. Implementation uses HTML5 DnD with a ref-backed drag source, `dataTransfer` payload, and a delegated drop handler on the scroll container so drops land reliably even when the cursor is over a nested element.
-- [x] Interactive task-list checkboxes — GFM `- [ ]` / `- [x]` render as real checkboxes via a CodeMirror widget (`src/renderer/src/editor/taskList.ts`). Clicking toggles the marker in the source. Raw markdown returns when the caret is on the line, matching Obsidian's live-preview.
-- [x] GFM pipe-table styling — table rows get monospaced columns and dimmed pipe delimiters so tables read as tables in the editor (`src/renderer/src/editor/tableStyling.ts`). Fully editable, no widget replacement.
-- [x] Markdown keyboard shortcuts — `Cmd+B` toggles `**bold**`, `Cmd+I` toggles `_italic_` around the selection (wraps / unwraps / inserts empty pair at caret). Lives in `src/renderer/src/editor/markdownShortcuts.ts`.
-- [x] Cloud-sync friendliness, Layer 1 — hash-guarded writes (skip `writeFile` when on-disk content already matches) + fsync before close + direct overwrite (no rename-over-temp, which breaks iCloud/pCloud). New `safe-write.ts` service used by `file:write`, `file:create`, tag propagation, and snapshot restore. Also: autosave debounce bumped from 1s → 2.5s, and the file tree now filters `~$*` / `*.crdownload` / `*.part` / `*.tmp` / `*.temp` sync junk on top of the existing dot-prefix skip. Addresses the "conflicted copy" duplicates that pCloud/OneDrive/iCloud/Proton Drive produce when the sync daemon races the app's save. See `docs/ARCHITECTURE.md` → *Cloud-sync friendliness* for the full reasoning and the Layer 2+ plan (filesystem watcher + conflict-group UI).
-- [x] Tag Manager — flat, filterable list of every tag in the vault with note counts (⌘⇧T or tag icon in the left sidebar header). New `TagManagerModal` (`src/renderer/src/components/modals/TagManagerModal.tsx`) calls a new `tagsService.removeTag(tag)` method on the main process via the new `tags:remove-tag` IPC channel. Deletion strips just the leading `#` from every occurrence across the vault — the words themselves are preserved, and tag-shaped text inside fenced/inline code, frontmatter, link destinations, autolinks, and bare URLs is protected via the existing `findProtectedRanges` from tag propagation. Each modified note gets a History snapshot before the rewrite (reversible per file), writes go through `safeWriteFile`, and the editor reloads from disk if the open file was rewritten. Sort by count (default) or A–Z; filter as you type; inline confirm step on each row.
+- [x] File tree with collapsible folders, persisted expand state
+- [x] Resizable sidebars, toggles in the status bar, persisted widths/visibility
+- [x] Dark/light theme toggle, accent color, font size (persisted)
+- [x] Auto-save (2.5 s debounce) with eager flush on blur / hide / quit / Cmd+S / note switch
+- [x] New note / new folder creation, rename, delete, drag-and-drop move
+- [x] Single instance lock
+- [x] System fonts (offline)
+- [x] Documentation folder (`docs/`)
+- [x] Inline markdown rendering — marks hidden on inactive lines (Obsidian-style live preview)
+- [x] Folder context menu
+- [x] Drag-and-drop attachments into `{vault}/vault_media/`, inline images via `vault-media://`
+- [x] Dedicated "Media Vault" section in the left sidebar
+- [x] Window size + position persisted
+- [x] Hashtag-based internal linking with an in-memory tag index
+- [x] Relations section (Also tagged / Mentioned)
+- [x] Automatic tag propagation
+- [x] Per-(file, tag) relation group expand/collapse state persisted
+- [x] Collapsible, reorderable right-sidebar sections (Document Info, Relations, History, AI Chat)
+- [x] Per-file history snapshots with Save / Restore / Delete
+- [x] Full-text search across the vault (⌘K)
+- [x] Security hardening, April 2026 (path guard, preload allowlist, CSP, sandbox, navigation guard)
+- [x] Tag Constellation (⌘⇧G)
+- [x] Local AI chat via Ollama with markdown rendering
+- [x] Interactive task-list checkboxes, GFM table styling, Cmd+B / Cmd+I
+- [x] Cloud-sync friendliness: hash-guarded writes, fsync, direct overwrite, junk-file filter
+- [x] Tag Manager (⌘⇧T)
+- [x] **Audit fixes, September 2026** — see [AUDIT-2026-09.md](AUDIT-2026-09.md) for the findings; in short:
+  - Data safety: edit-version save guard (fixes the lost-keystroke bug), failed saves surface in the status bar and keep the note dirty, per-document editor instances (no cross-note undo), renames refuse to overwrite, deletes go to the Trash, conflict copies when a note changed on disk, flush before every destructive operation, last opened note reopens on launch.
+  - Tag propagation: protected ranges apply on both sides, only new tags propagate, never the tag under the caret, automatic snapshots in their own ring so manual ones are never evicted, mentions ignore code/links.
+  - Security: `attachment:open` extension allowlist, symlink-free walker and guard, `app://` scheme with a strict navigation guard and header CSP, validated snapshot ids, vault roots restricted to dialog-chosen folders, deny-all permission handlers, Electron fuses, trimmed entitlements, packaged asar limited to `out/` + `package.json`, Electron 41.10 (advisories fixed).
+  - Performance: no full vault rescans after mutations (main patches and broadcasts the tree), incremental propagation with cached protected ranges, no per-keystroke React re-render, chat owned by its section with coalesced chunks, sidebar resize committed on mouse-up, cached lower-cased search text, throttled constellation rendering, minified bundles.
+  - Structure: one typed IPC contract, one renderer store with selectors, an editor-buffer hook that owns saving, shared Modal/Escape/icon modules, ~1,000 lines of dead code removed, ESLint flat config, vitest suite (46 tests), docs rewritten.
 
 ## Future Enhancements
 
-- [ ] GFM table rendering (replace raw `|` pipe text with proper table layout via widget decorations)
-- [ ] Tags and metadata
-- [ ] Backlinks / wiki-style linking
+- [ ] Layer 2 cloud-sync: a filesystem watcher (`fs.watch` / chokidar) so external edits reload clean notes immediately and the tree/index update without any user action; a Conflicts panel listing `(conflict …)` siblings with compare/merge actions
+- [ ] Make the Ollama base URL configurable in Settings → AI
+- [ ] GFM table rendering (proper table layout via widget decorations)
+- [ ] Frontmatter / metadata editing
+- [ ] Backlinks / wiki-style `[[links]]`
 - [ ] Templates for folders
 - [ ] Export to PDF/HTML
 - [ ] Keyboard shortcuts panel
 - [ ] Recent files list
+- [ ] Windows: verify path handling end-to-end (renderer helpers accept both separators, but the Windows build has not been exercised)

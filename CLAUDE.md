@@ -64,50 +64,72 @@ with the pattern
 All long-form project documentation lives in `docs/`. This is the single source of truth — **read before changing, update after changing**. Do not create new docs outside this folder.
 
 - **[README.md](README.md)** — User-facing overview (features, getting started, build). Update the features list whenever user-visible functionality is added, changed, or removed. This is what people see on GitHub; keep it accurate.
-- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — System architecture, state model, IPC design, persistence. Update when process model, state shape, IPC channels, or directory layout changes.
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — System architecture, state model, IPC design, persistence, security posture. Update when process model, state shape, IPC channels, or directory layout changes.
 - **[docs/DEPENDENCIES.md](docs/DEPENDENCIES.md)** — All packages with spec + installed version, runtime environment. Update when adding, removing, or upgrading any dependency.
 - **[docs/TODO.md](docs/TODO.md)** — Known issues, in-progress work, future enhancements. Update when starting new work, finding a bug, or completing a feature.
+- **[docs/AUDIT-2026-09.md](docs/AUDIT-2026-09.md)** — Full code audit (data safety, security, performance, dead code, architecture, docs drift) with its resolution status. Historical record; do not add new findings here, use TODO.md.
 
 If you add a new doc (design decisions, feature specs, debugging notes), create it inside `docs/` and link it from this list.
 
 
 ## Tech Stack
-- **Framework**: Electron + React 18 + TypeScript
-- **Build Tool**: electron-vite 2.3.0 + Vite 5.4
+- **Framework**: Electron 41 + React 19 + TypeScript 6
+- **Build Tool**: electron-vite 5 + Vite 7 (minified output for all three targets)
 - **Styling**: TailwindCSS 4 with CSS custom properties
-- **State**: Zustand (vanilla store in main process, React hooks in renderer)
+- **State**: Zustand in both processes — an authoritative vanilla store in main, a mirror-plus-editor-status store in the renderer with selectors
 - **Editor**: CodeMirror 6 with custom markdown extensions
-- **IPC**: Type-safe channels with typed handlers
+- **IPC**: One typed contract in `src/shared/ipc.ts` drives the preload allowlist, the main-process `handle()` helper, and `window.api`
+- **Tests**: vitest for the pure and filesystem-only modules (`npm test`)
+- **Lint**: ESLint 9 flat config (`eslint.config.mjs`)
 
 ## Project Structure
 ```
 src/
-├── main/                    # Electron main process
-│   ├── index.ts            # Entry point, window creation
-│   ├── ipc/handlers.ts     # IPC handler registration
-│   ├── services/           # File, settings, vault services
-│   └── store/              # Main process Zustand store
+├── main/                        # Electron main process
+│   ├── index.ts                 # Lifecycle, window, app:// + vault-media:// protocols, navigation guards
+│   ├── ipc/
+│   │   ├── bridge.ts            # Typed handle() / broadcast() helpers
+│   │   └── handlers.ts          # Every IPC handler
+│   ├── services/
+│   │   ├── history-service.ts   # Per-note snapshots (manual + automatic rings)
+│   │   ├── ollama-service.ts    # Ollama HTTP client (model list, streaming chat)
+│   │   ├── path-guard.ts        # Vault confinement via realpath + external URL allowlist
+│   │   ├── settings-service.ts  # ~/.rune/*.json persistence (atomic writes)
+│   │   ├── tags-service.ts      # Tag index, propagation, relations, graph, search
+│   │   ├── vault-files.ts       # Note reads/writes, change tracking, conflict copies
+│   │   └── vault-walk.ts        # Symlink-safe tree walker
+│   └── store/index.ts           # Authoritative Zustand store (settings, ui, fileTree)
 ├── preload/
-│   ├── index.ts            # contextBridge API exposure
-│   └── index.d.ts          # Type declarations for window.api
-├── renderer/src/           # React application
-│   ├── App.tsx
-│   ├── main.tsx
+│   ├── index.ts                 # contextBridge: invoke/on with allowlists derived from the contract
+│   └── index.d.ts               # window.api type
+├── renderer/src/
+│   ├── App.tsx                  # Vault lifecycle, editor mount, restore confirmation
 │   ├── components/
-│   │   └── layout/         # AppLayout, sidebars, status bar
-│   ├── hooks/useStore.ts   # Store hooks for renderer
-│   └── styles/globals.css  # Theme variables, base styles
-└── shared/types/           # Shared type definitions
-    ├── store.ts            # Store state types
-    ├── ipc.ts              # IPC channel types
-    └── index.ts            # Re-exports
+│   │   ├── editor/              # MarkdownEditor, EditableTitle
+│   │   ├── layout/              # AppLayout, LeftSidebar, RightSidebar, StatusBar, SearchPanel, AIChatSection, ResizeHandle
+│   │   ├── modals/              # Welcome, Settings, Confirm, Input, TagManager, TagConstellation
+│   │   └── ui/                  # Modal, ContextMenu, icons
+│   ├── editor/                  # useCodeMirror, theme, extensions (markHiding, inlineImages, linkClicks, tagHighlight, taskList, tableStyling, markdownShortcuts)
+│   ├── hooks/                   # useEditorBuffer, useVaultActions, useVaultData, useChat, useGlobalShortcuts, useThemeEffects, useEscapeKey
+│   ├── lib/api.ts               # Typed wrappers around window.api
+│   ├── store/index.ts           # Renderer Zustand store (main mirror + editor status)
+│   └── styles/globals.css       # Theme variables, base styles
+└── shared/
+    ├── ipc.ts                   # THE IPC contract (channel maps + runtime lists)
+    ├── constants.ts             # Folder names, schemes, autosave delay
+    ├── paths.ts                 # Separator-agnostic path helpers, name sanitising
+    ├── tag-core.ts              # Pure tag recognition + protected ranges
+    └── types/                   # store, tags, history, search, ai
 ```
 
 ## Key Commands
 ```bash
 npm run dev          # Start dev server (with ELECTRON_RUN_AS_NODE fix)
 npm run build        # Build for production
-npm run build:mac    # Build macOS app
+npm run build:mac    # Build macOS app (both architectures); build:mac-arm for Apple Silicon only
+npm run typecheck    # tsc for the node and web projects
+npm run lint         # ESLint
+npm test             # vitest (unit tests live next to the code as *.test.ts)
 ```
 
 ## Important Notes
@@ -115,24 +137,35 @@ npm run build:mac    # Build macOS app
 ### VS Code Terminal Fix
 When running from VS Code's terminal, `ELECTRON_RUN_AS_NODE=1` is set (VS Code is Electron-based). The dev script includes `unset ELECTRON_RUN_AS_NODE &&` to fix this.
 
+### Running a second, isolated instance
+The packaged Rune.app holds the single-instance lock, so a dev instance normally quits silently (see `tasks/lessons.md`). To run one alongside it:
+
+```bash
+RUNE_CONFIG_DIR=/tmp/rune-test/.rune ./node_modules/.bin/electron --user-data-dir=/tmp/rune-test/userdata out/main/index.js
+```
+
+`RUNE_CONFIG_DIR` replaces `~/.rune` (settings, UI state, window state); `--user-data-dir` gives Electron its own profile and lock. On macOS `$HOME` is ignored by `app.getPath('home')`, which is why the env var exists.
+
 ### Native Title Bar
-Uses `titleBarStyle: 'hiddenInset'` with traffic lights. Left sidebar has 52px top padding to accommodate.
+Uses `titleBarStyle: 'hiddenInset'` with traffic lights. Sidebars have 52px top padding to accommodate.
 
 ### State Architecture
-- **Main process**: Holds authoritative Zustand store, persists to `~/.rune/`
-- **Renderer**: Gets state via IPC, receives updates via events
-- **File content**: NOT stored in state - read on demand from disk
+- **Main process**: Holds the authoritative Zustand store (`settings`, `ui`, `fileTree`), persists to `~/.rune/`, and rebuilds/broadcasts the file tree after every mutation.
+- **Renderer**: One Zustand store mirrors those slices (hydrated once, patched by `store:state-changed`) and adds renderer-local editor status. Components subscribe with selectors.
+- **Editor buffer**: `useEditorBuffer` is the only owner of the open note's text, dirty flag, and autosave timer. Text lives in refs; nothing re-renders per keystroke. The CodeMirror view is keyed per document so undo history never crosses notes.
+- **File content**: Never in any store. Read on demand via `file:read`, written via `file:write`, which detects external changes and keeps conflict copies.
 
 ### Theme System
 CSS custom properties in `globals.css`. Toggle between dark/light by adding/removing `.light` class on document root.
 
 ### IPC Channels
-All channels defined in `src/shared/types/ipc.ts`:
-- `dialog:*` - Native dialogs
-- `file:*` - File operations
-- `folder:*` - Folder operations
-- `vault:*` - Vault management
-- `store:*` - State sync
+All channels are defined once in `src/shared/ipc.ts` (`InvokeMap` and `EventMap`). Adding a channel means adding it to the map and to the runtime list in the same file; a mismatch is a compile error. Groups:
+- `dialog:*`, `vault:*` — vault selection and opening
+- `file:*`, `folder:*` — note and folder operations (results are `{ ok } | { ok: false, error }`)
+- `attachment:*`, `shell:*` — attachments and external links
+- `store:*` — settings and UI state
+- `tags:*`, `search:*`, `history:*`, `ai:*` — index, search, snapshots, Ollama
+- Events: `store:state-changed`, `file:external-change`, `tags:index-changed`, `history:changed`, `ai:chat-*`
 
 ## Current Status
 
