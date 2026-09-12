@@ -1,32 +1,25 @@
-import type {
-  OllamaModel,
-  ChatMessageSend
-} from '@shared/types/ai'
+import type { ChatMessageSend, OllamaModel } from '@shared/types/ai'
 import { OLLAMA_BASE_URL } from '@shared/types/ai'
+import type { Result } from '@shared/ipc'
 
-export interface ListModelsResult {
-  ok: true
-  models: OllamaModel[]
+// Abort a stream that produces nothing for this long.
+const STALL_TIMEOUT_MS = 60_000
+// A single NDJSON line should never approach this; treat it as a broken stream.
+const MAX_LINE_BUFFER = 1_000_000
+const UNREACHABLE = 'Could not reach Ollama at localhost:11434 — is it running?'
+
+function describe(error: unknown): string {
+  const msg = error instanceof Error ? error.message : String(error)
+  return msg.includes('fetch failed') || msg.includes('ECONNREFUSED') ? UNREACHABLE : msg
 }
 
-export interface ListModelsError {
-  ok: false
-  error: string
-}
-
-/**
- * Fetch the list of locally-installed Ollama models. Returns a
- * discriminated union so callers can surface a friendly message when
- * Ollama is not running or is unreachable.
- */
-export async function listModels(): Promise<ListModelsResult | ListModelsError> {
+/** Installed models, or a friendly error when Ollama is not running. */
+export async function listModels(): Promise<Result<{ models: OllamaModel[] }>> {
   try {
     const res = await fetch(`${OLLAMA_BASE_URL}/api/tags`, {
       signal: AbortSignal.timeout(3000)
     })
-    if (!res.ok) {
-      return { ok: false, error: `Ollama returned ${res.status}` }
-    }
+    if (!res.ok) return { ok: false, error: `Ollama returned ${res.status}` }
     const data = (await res.json()) as {
       models?: Array<{ name: string; size?: number; modified_at?: string }>
     }
@@ -37,21 +30,14 @@ export async function listModels(): Promise<ListModelsResult | ListModelsError> 
     }))
     return { ok: true, models }
   } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error)
-    if (msg.includes('fetch failed') || msg.includes('ECONNREFUSED')) {
-      return {
-        ok: false,
-        error: 'Could not reach Ollama at localhost:11434 — is it running?'
-      }
-    }
-    return { ok: false, error: msg }
+    return { ok: false, error: describe(error) }
   }
 }
 
 /**
- * Stream a chat completion. Calls onDelta for each text chunk, onDone
- * when the stream finishes, and onError if anything goes wrong.
- * Uses the provided AbortSignal so the caller can cancel mid-stream.
+ * Stream a chat completion. Calls onDelta per text chunk, onDone when the
+ * stream finishes, onError otherwise. `signal` cancels; a stall timeout
+ * guards against a server that stops sending without closing.
  */
 export async function streamChat(
   model: string,
@@ -61,33 +47,55 @@ export async function streamChat(
   onDone: () => void,
   onError: (msg: string) => void
 ): Promise<void> {
+  const internal = new AbortController()
+  let stalled = false
+  let stallTimer: ReturnType<typeof setTimeout> | undefined
+  const armStall = (): void => {
+    if (stallTimer) clearTimeout(stallTimer)
+    stallTimer = setTimeout(() => {
+      stalled = true
+      internal.abort()
+    }, STALL_TIMEOUT_MS)
+  }
+  const onUserAbort = (): void => internal.abort()
+  signal.addEventListener('abort', onUserAbort, { once: true })
+  const cleanup = (): void => {
+    if (stallTimer) clearTimeout(stallTimer)
+    signal.removeEventListener('abort', onUserAbort)
+  }
+  const handleFailure = (error: unknown): void => {
+    if (signal.aborted) return
+    if (stalled) {
+      onError(`No response from Ollama for ${STALL_TIMEOUT_MS / 1000} seconds`)
+      return
+    }
+    onError(describe(error))
+  }
+
   let res: Response
   try {
+    armStall()
     res = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model, messages, stream: true }),
-      signal
+      signal: internal.signal
     })
   } catch (error) {
-    if ((error as Error).name === 'AbortError') return
-    const msg = error instanceof Error ? error.message : String(error)
-    if (msg.includes('fetch failed') || msg.includes('ECONNREFUSED')) {
-      onError('Could not reach Ollama at localhost:11434 — is it running?')
-    } else {
-      onError(msg)
-    }
+    cleanup()
+    handleFailure(error)
     return
   }
 
   if (!res.ok || !res.body) {
     let detail = `Ollama returned ${res.status}`
     try {
-      const body = await res.text()
+      const body = (await res.text()).slice(0, 500)
       if (body) detail = `${detail}: ${body}`
     } catch {
       /* ignore */
     }
+    cleanup()
     onError(detail)
     return
   }
@@ -100,35 +108,37 @@ export async function streamChat(
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
+      armStall()
       buffer += decoder.decode(value, { stream: true })
-      let idx
+      if (buffer.length > MAX_LINE_BUFFER) throw new Error('Malformed stream from Ollama')
+      let idx: number
       while ((idx = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0, idx).trim()
         buffer = buffer.slice(idx + 1)
         if (!line) continue
+        let obj: { message?: { content?: string }; done?: boolean; error?: string }
         try {
-          const obj = JSON.parse(line) as {
-            message?: { content?: string }
-            done?: boolean
-            error?: string
-          }
-          if (obj.error) {
-            onError(obj.error)
-            return
-          }
-          if (obj.message?.content) onDelta(obj.message.content)
-          if (obj.done) {
-            onDone()
-            return
-          }
+          obj = JSON.parse(line)
         } catch {
-          /* skip malformed line */
+          continue
+        }
+        if (obj.error) {
+          cleanup()
+          onError(obj.error)
+          return
+        }
+        if (obj.message?.content) onDelta(obj.message.content)
+        if (obj.done) {
+          cleanup()
+          onDone()
+          return
         }
       }
     }
+    cleanup()
     onDone()
   } catch (error) {
-    if ((error as Error).name === 'AbortError') return
-    onError(error instanceof Error ? error.message : String(error))
+    cleanup()
+    handleFailure(error)
   }
 }

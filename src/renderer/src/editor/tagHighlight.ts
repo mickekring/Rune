@@ -7,13 +7,12 @@ import {
   type ViewUpdate
 } from '@codemirror/view'
 import { syntaxTree } from '@codemirror/language'
+import { createTagRegex } from '@shared/tag-core'
 
-// Matches #TagName where # is preceded by start-of-line or a non-word /
-// non-hash character, and the tag name is ≥2 letters/digits (unicode),
-// and contains at least one letter (excludes #000000 hex colors etc.).
-const TAG_REGEX = /(?<=^|[^\w#])#((?=[\p{L}\p{N}_-]*\p{L})[\p{L}\p{N}_-]{2,})/gu
-
-const HEADING_NODES = new Set([
+// Highlights #tags using the same recognition rule as the main-process
+// index. A `#` inside a heading, code, or a link destination is not a tag
+// there either, so it is not highlighted here.
+const SKIP_NODES = new Set([
   'ATXHeading1',
   'ATXHeading2',
   'ATXHeading3',
@@ -21,20 +20,24 @@ const HEADING_NODES = new Set([
   'ATXHeading5',
   'ATXHeading6',
   'SetextHeading1',
-  'SetextHeading2'
+  'SetextHeading2',
+  'FencedCode',
+  'CodeBlock',
+  'InlineCode',
+  'URL',
+  'Autolink'
 ])
 
 const tagMark = Decoration.mark({ class: 'cm-tag' })
 
-function isInsideHeading(
-  view: EditorView,
-  pos: number
-): boolean {
-  const node = syntaxTree(view.state).resolveInner(pos, 1)
-  let cur: typeof node | null = node
-  while (cur) {
-    if (HEADING_NODES.has(cur.name)) return true
-    cur = cur.parent
+function isInsideSkipped(view: EditorView, pos: number): boolean {
+  let node: ReturnType<typeof syntaxTree>['topNode'] | null = syntaxTree(view.state).resolveInner(
+    pos,
+    1
+  )
+  while (node) {
+    if (SKIP_NODES.has(node.name)) return true
+    node = node.parent
   }
   return false
 }
@@ -43,15 +46,12 @@ function buildDecorations(view: EditorView): DecorationSet {
   const builder = new RangeSetBuilder<Decoration>()
   for (const { from, to } of view.visibleRanges) {
     const text = view.state.doc.sliceString(from, to)
-    TAG_REGEX.lastIndex = 0
+    const re = createTagRegex()
     let match: RegExpExecArray | null
-    while ((match = TAG_REGEX.exec(text)) !== null) {
-      // match.index points at the char that preceded `#` (or -1 for BOF).
-      // We want the `#` itself as the start.
-      const hashOffset = match.index + (match[0].length - match[1].length - 1)
-      const start = from + hashOffset
-      const end = start + match[1].length + 1 // include the '#'
-      if (isInsideHeading(view, start)) continue
+    while ((match = re.exec(text)) !== null) {
+      const start = from + match.index
+      const end = start + match[0].length
+      if (isInsideSkipped(view, start)) continue
       builder.add(start, end, tagMark)
     }
   }
@@ -72,7 +72,5 @@ export const tagHighlight = ViewPlugin.fromClass(
       }
     }
   },
-  {
-    decorations: (v) => v.decorations
-  }
+  { decorations: (v) => v.decorations }
 )

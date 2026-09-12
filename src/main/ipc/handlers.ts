@@ -1,692 +1,577 @@
-import { ipcMain, dialog, BrowserWindow, shell } from 'electron'
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, renameSync, readdirSync, statSync, lstatSync, rmdirSync, copyFileSync } from 'fs'
-import { join, extname, basename } from 'path'
-import type { FileNode, FontSize } from '@shared/types/store'
+import { BrowserWindow, dialog, shell } from 'electron'
+import {
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  writeFileSync
+} from 'fs'
+import { homedir } from 'os'
+import { basename, extname, join, sep } from 'path'
+import type { Err, EventData } from '@shared/ipc'
+import type { ChatMessageSend } from '@shared/types/ai'
+import { APP_DIR_NAME, MEDIA_FOLDER_NAME } from '@shared/constants'
 import { mainStore } from '../store'
 import { tagsService } from '../services/tags-service'
 import { historyService } from '../services/history-service'
 import { listModels, streamChat } from '../services/ollama-service'
-import type { ChatMessageSend } from '@shared/types/ai'
-import { migrateVaultAppDir } from '../services/settings-service'
-import { safeInsideVault, isSafeExternalUrl } from '../services/path-guard'
-import { safeWriteFile } from '../services/safe-write'
+import { isSafeExternalUrl, safeInsideVault } from '../services/path-guard'
+import { buildFileTree, collectMarkdownFiles } from '../services/vault-walk'
+import {
+  forgetPath,
+  movePath,
+  readVaultFile,
+  writeVaultFile
+} from '../services/vault-files'
+import { broadcast, handle, sendTo } from './bridge'
 
-export const MEDIA_FOLDER_NAME = 'vault_media'
+// Vault roots the user picked through the native dialog this session,
+// plus the persisted one. `vault:open` accepts nothing else, so the
+// renderer cannot move the confinement root somewhere it likes.
+const allowedVaultRoots = new Set<string>()
 
-// Patterns for sync-service and editor junk files we never want to
-// surface in the file tree. Hidden-dotfile patterns (`.sync-conflict-*`,
-// `.~lock.*`, `*.icloud`, `.DS_Store`) are already caught by the
-// `startsWith('.')` check; these are the remaining non-dot forms.
-const JUNK_FILENAME_PATTERNS: RegExp[] = [
-  /^~\$/, // MS Office / LibreOffice lock files (~$doc.md, ~$file.docx)
-  /\.crdownload$/i, // Chrome partial download
-  /\.part$/i, // generic partial transfer
-  /\.tmp$/i, // generic temp
-  /\.temp$/i
-]
+// Files `attachment:open` may hand to the OS default handler. Anything
+// else (scripts, apps, archives, unknown types) is revealed in the file
+// manager instead, so a synced note can never launch code with a click.
+const OPENABLE_EXTENSIONS = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.avif', '.heic', '.tif', '.tiff',
+  '.pdf', '.txt', '.md', '.csv', '.json', '.rtf',
+  '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt', '.ods', '.odp',
+  '.pages', '.numbers', '.key', '.epub',
+  '.mp3', '.m4a', '.wav', '.aac', '.flac', '.ogg',
+  '.mp4', '.mov', '.m4v', '.webm'
+])
 
-function isJunkFilename(name: string): boolean {
-  for (const re of JUNK_FILENAME_PATTERNS) {
-    if (re.test(name)) return true
-  }
-  return false
+function fail(error: string): Err {
+  return { ok: false, error }
 }
 
-// Helper to build file tree from a directory.
-// Non-markdown files are only shown inside vault_media (and its descendants),
-// so the main tree stays clean while attachments remain browsable.
-function buildFileTree(
-  dirPath: string,
-  parentPath = '',
-  allowAllFiles = false
-): FileNode[] {
-  const items: FileNode[] = []
-
-  try {
-    const entries = readdirSync(dirPath, { withFileTypes: true })
-
-    for (const entry of entries) {
-      // Skip hidden files and the .rune config folder (or any legacy
-      // .arbetsyta, since both begin with a dot). Also catches iCloud
-      // placeholders (.Name.ext.icloud), Syncthing/Proton conflict
-      // markers (.sync-conflict-*), and LibreOffice lock files
-      // (.~lock.*#).
-      if (entry.name.startsWith('.')) continue
-
-      // Skip sync-service / editor junk that isn't dot-prefixed.
-      if (isJunkFilename(entry.name)) continue
-
-      const fullPath = join(dirPath, entry.name)
-      const relativePath = parentPath ? join(parentPath, entry.name) : entry.name
-      const stats = statSync(fullPath)
-      const isMediaRoot = parentPath === '' && entry.name === MEDIA_FOLDER_NAME
-
-      // Skip non-markdown files outside the media folder
-      if (entry.isFile() && !allowAllFiles && !entry.name.endsWith('.md')) continue
-
-      const node: FileNode = {
-        id: relativePath,
-        name: entry.name,
-        path: fullPath,
-        type: entry.isDirectory() ? 'folder' : 'file',
-        modifiedAt: stats.mtimeMs
-      }
-
-      if (entry.isDirectory()) {
-        node.children = buildFileTree(
-          fullPath,
-          relativePath,
-          allowAllFiles || isMediaRoot
-        )
-      }
-
-      items.push(node)
-    }
-
-    // Sort: folders first, then by name
-    items.sort((a, b) => {
-      if (a.type !== b.type) return a.type === 'folder' ? -1 : 1
-      return a.name.localeCompare(b.name)
-    })
-  } catch (error) {
-    console.error(`Error reading directory ${dirPath}:`, error)
-  }
-
-  return items
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
-// Copy an external file into {vault}/vault_media/ with collision-safe
-// naming. Returns the relative path (for markdown insertion) and the
-// final filename.
-//
-// SECURITY: the sourcePath comes from the renderer. We:
-//  - reject symlinks (lstat) so a dropped alias can't leak the target
-//  - require a regular file (no fifos, devices, etc.)
-//  - extract the filename via path.basename so Windows backslash
-//    separators don't smuggle an absolute destination through join()
-function saveAttachmentToVault(
-  vaultPath: string,
-  sourcePath: string
-): { filename: string; relativePath: string } | null {
+function safeRealpath(path: string): string | null {
   try {
-    // lstatSync does NOT follow symlinks, so we can detect them.
-    const stat = lstatSync(sourcePath)
-    if (stat.isSymbolicLink()) {
-      console.warn('attachment:save refused symlink:', sourcePath)
-      return null
-    }
-    if (!stat.isFile()) {
-      console.warn('attachment:save refused non-regular file:', sourcePath)
-      return null
-    }
-
-    const mediaDir = join(vaultPath, MEDIA_FOLDER_NAME)
-    if (!existsSync(mediaDir)) {
-      mkdirSync(mediaDir, { recursive: true })
-    }
-
-    // path.basename correctly handles both / and \ on Windows.
-    const originalName = basename(sourcePath)
-    const ext = extname(originalName)
-    const base = ext.length
-      ? originalName.slice(0, -ext.length)
-      : originalName
-    let filename = `${base}${ext}`
-    let destPath = join(mediaDir, filename)
-    let counter = 1
-    while (existsSync(destPath)) {
-      filename = `${base}-${counter}${ext}`
-      destPath = join(mediaDir, filename)
-      counter += 1
-    }
-
-    copyFileSync(sourcePath, destPath)
-
-    return {
-      filename,
-      relativePath: `${MEDIA_FOLDER_NAME}/${filename}`
-    }
-  } catch (error) {
-    console.error('Error saving attachment:', error)
+    return realpathSync(path)
+  } catch {
     return null
   }
 }
 
-// Initialize vault config (no auto-folder creation - folders are user-managed)
-function initVaultStructure(vaultPath: string): boolean {
-  try {
-    // Migrate any legacy app-dir name (e.g. `.arbetsyta`) -> `.rune`
-    const configPath = migrateVaultAppDir(vaultPath)
-    if (!existsSync(configPath)) {
-      mkdirSync(configPath, { recursive: true })
-      writeFileSync(
-        join(configPath, 'config.json'),
-        JSON.stringify({ version: 1, createdAt: Date.now() }, null, 2)
-      )
-    }
+function currentVault(): string | null {
+  return mainStore.getState().settings.vaultPath
+}
 
-    return true
-  } catch (error) {
-    console.error('Error initializing vault structure:', error)
+function refreshTree(): void {
+  const root = currentVault()
+  if (!root) return
+  const tree = buildFileTree(root)
+  mainStore.getState().setFileTree(tree)
+  broadcast('store:state-changed', { fileTree: tree })
+}
+
+function broadcastIndex(): void {
+  broadcast('tags:index-changed', { version: tagsService.getVersion() })
+}
+
+function notifyRewrites(
+  paths: string[],
+  reason: EventData<'file:external-change'>['reason']
+): void {
+  if (paths.length === 0) return
+  broadcast('file:external-change', { paths, reason })
+  for (const filePath of paths) broadcast('history:changed', { filePath })
+}
+
+// Refuse vault roots that would confine "everything": the filesystem
+// root, the home folder, top-level folders like /Users, and volume roots.
+function isForbiddenVaultRoot(real: string): boolean {
+  if (real === '/' || real === safeRealpath(homedir())) return true
+  if (/^[A-Za-z]:\\?$/.test(real)) return true
+  if (/^\/Volumes\/[^/]+\/?$/.test(real)) return true
+  return real.split(sep).filter(Boolean).length <= 1
+}
+
+function ensureVaultConfig(root: string): void {
+  const dir = join(root, APP_DIR_NAME)
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+  const config = join(dir, 'config.json')
+  if (!existsSync(config)) {
+    writeFileSync(config, JSON.stringify({ version: 1, createdAt: Date.now() }, null, 2))
+  }
+}
+
+function afterNoteChanged(safe: string, content: string, caretOffset?: number): void {
+  tagsService.updateFile(safe, content)
+  const propagated = tagsService.propagateTags(safe, caretOffset)
+  broadcastIndex()
+  notifyRewrites(propagated, 'propagation')
+}
+
+// Copy an OS-dropped file into {vault}/vault_media/ with collision-safe
+// naming. The source path comes from the renderer: reject symlinks and
+// non-regular files, and take only the basename so a `\` on Windows can
+// never smuggle a destination through join().
+function saveAttachment(
+  vaultPath: string,
+  sourcePath: string
+): { filename: string; relativePath: string } {
+  const stat = lstatSync(sourcePath)
+  if (stat.isSymbolicLink()) throw new Error('Symbolic links cannot be attached')
+  if (!stat.isFile()) throw new Error('Only regular files can be attached')
+
+  const mediaDir = join(vaultPath, MEDIA_FOLDER_NAME)
+  if (!existsSync(mediaDir)) mkdirSync(mediaDir, { recursive: true })
+
+  const originalName = basename(sourcePath)
+  const ext = extname(originalName)
+  const base = ext ? originalName.slice(0, -ext.length) : originalName
+  let filename = originalName
+  let destPath = join(mediaDir, filename)
+  let counter = 1
+  while (existsSync(destPath)) {
+    filename = `${base}-${counter}${ext}`
+    destPath = join(mediaDir, filename)
+    counter += 1
+  }
+  copyFileSync(sourcePath, destPath)
+  return { filename, relativePath: `${MEDIA_FOLDER_NAME}/${filename}` }
+}
+
+// Move a file or folder to the OS Trash instead of deleting permanently.
+async function trashPath(path: string): Promise<void> {
+  await shell.trashItem(path)
+  forgetPath(path)
+}
+
+function sameInode(a: string, b: string): boolean {
+  try {
+    return statSync(a).ino === statSync(b).ino
+  } catch {
     return false
   }
 }
 
-function broadcastTagIndex(): void {
-  const snapshot = tagsService.getSnapshot()
-  BrowserWindow.getAllWindows().forEach((win) => {
-    win.webContents.send('tags:index-changed', snapshot)
-  })
-}
-
-function broadcastHistoryChanged(filePath: string): void {
-  BrowserWindow.getAllWindows().forEach((win) => {
-    win.webContents.send('history:changed', { filePath })
-  })
-}
-
 export function registerIPCHandlers(): void {
-  // Dialog handlers
-  ipcMain.handle('dialog:select-vault', async () => {
+  const persisted = currentVault()
+  if (persisted) {
+    const real = safeRealpath(persisted)
+    if (real) allowedVaultRoots.add(real)
+  }
+
+  // --- Vault ----------------------------------------------------------
+
+  handle('dialog:select-vault', async () => {
     const result = await dialog.showOpenDialog({
       properties: ['openDirectory', 'createDirectory'],
       title: 'Select Vault Location',
       buttonLabel: 'Select Vault'
     })
-
-    return result.canceled ? null : result.filePaths[0]
+    if (result.canceled || !result.filePaths[0]) return null
+    const real = safeRealpath(result.filePaths[0])
+    if (!real) return null
+    allowedVaultRoots.add(real)
+    return real
   })
 
-  // File handlers. Every path-taking handler routes the renderer-
-  // supplied path through `safeInsideVault`, which realpath-resolves
-  // it and rejects anything outside the currently-open vault root.
-  ipcMain.handle('file:read', async (_, path: string) => {
-    const safe = safeInsideVault(path)
-    if (!safe) throw new Error('file:read rejected: path outside vault')
-    return readFileSync(safe, 'utf-8')
-  })
-
-  ipcMain.handle('file:write', async (_, path: string, content: string) => {
-    const safe = safeInsideVault(path)
-    if (!safe) return false
+  handle('vault:open', async (_, path) => {
+    if (typeof path !== 'string') return fail('Invalid vault path')
+    const real = safeRealpath(path)
+    if (!real) return fail(`Vault folder not found: ${path}`)
+    if (!allowedVaultRoots.has(real)) return fail('Choose the vault through the folder picker')
+    if (isForbiddenVaultRoot(real)) {
+      return fail('Use a dedicated folder for the vault, not the home folder or a drive root')
+    }
     try {
-      // Hash-guarded: no-op when on-disk content already matches. This
-      // prevents spurious writes from creating sync-daemon race windows
-      // and keeps the tag index + auto-propagation from firing on every
-      // keystroke that didn't actually change the file.
-      const changed = safeWriteFile(safe, content)
-      if (!changed) return true
-      tagsService.updateFile(safe, content)
-      const propagated = tagsService.propagateTags(safe)
-      if (propagated.length > 0) {
-        console.log(
-          `tags: auto-tagged ${propagated.length} file(s) from ${safe}`
-        )
+      if (!statSync(real).isDirectory()) return fail('The vault path is not a folder')
+      ensureVaultConfig(real)
+    } catch (error) {
+      return fail(messageOf(error))
+    }
+
+    const tree = buildFileTree(real)
+    const store = mainStore.getState()
+    store.setFileTree(tree)
+    store.setVaultPath(real)
+    historyService.setVaultPath(real)
+    tagsService.scanVault(real, collectMarkdownFiles(tree))
+
+    broadcast('store:state-changed', { settings: { vaultPath: real }, fileTree: tree })
+    broadcastIndex()
+    return { ok: true, fileTree: tree, vaultPath: real }
+  })
+
+  // --- Files ----------------------------------------------------------
+
+  handle('file:read', async (_, path) => {
+    const safe = safeInsideVault(path)
+    if (!safe) return fail('Path is outside the vault')
+    try {
+      return { ok: true, content: readVaultFile(safe) }
+    } catch (error) {
+      return fail(messageOf(error))
+    }
+  })
+
+  handle('file:write', async (_, path, content, options) => {
+    const safe = safeInsideVault(path)
+    if (!safe) return fail('Path is outside the vault')
+    if (typeof content !== 'string') return fail('Invalid content')
+    try {
+      const outcome = writeVaultFile(safe, content, { detectConflict: true })
+      if (outcome.conflictCopy) {
+        tagsService.updateFile(outcome.conflictCopy)
+        refreshTree()
       }
-      broadcastTagIndex()
-      return true
-    } catch {
-      return false
+      if (outcome.changed) afterNoteChanged(safe, content, options?.caretOffset)
+      return { ok: true, ...outcome }
+    } catch (error) {
+      return fail(messageOf(error))
     }
   })
 
-  ipcMain.handle('file:create', async (_, path: string, content = '') => {
+  handle('file:create', async (_, path, content = '') => {
     const safe = safeInsideVault(path)
-    if (!safe) return false
+    if (!safe) return fail('Path is outside the vault')
+    if (existsSync(safe)) return fail('A note with that name already exists')
     try {
-      safeWriteFile(safe, content)
-      tagsService.updateFile(safe, content)
-      tagsService.propagateTags(safe)
-      broadcastTagIndex()
-      return true
-    } catch {
-      return false
+      writeVaultFile(safe, content)
+      afterNoteChanged(safe, content)
+      refreshTree()
+      return { ok: true }
+    } catch (error) {
+      return fail(messageOf(error))
     }
   })
 
-  ipcMain.handle('file:delete', async (_, path: string) => {
+  handle('file:delete', async (_, path) => {
     const safe = safeInsideVault(path)
-    if (!safe) return false
+    if (!safe) return fail('Path is outside the vault')
+    if (safe === currentVault()) return fail('Cannot delete the vault itself')
     try {
-      unlinkSync(safe)
-      tagsService.removeFile(safe)
-      broadcastTagIndex()
-      return true
-    } catch {
-      return false
+      await trashPath(safe)
+      tagsService.removePath(safe)
+      historyService.onPathDeleted(safe)
+      refreshTree()
+      broadcastIndex()
+      return { ok: true }
+    } catch (error) {
+      return fail(`Could not move to Trash: ${messageOf(error)}`)
     }
   })
 
-  ipcMain.handle('file:rename', async (_, oldPath: string, newPath: string) => {
+  handle('file:rename', async (_, oldPath, newPath) => {
     const safeOld = safeInsideVault(oldPath)
     const safeNew = safeInsideVault(newPath)
-    if (!safeOld || !safeNew) return false
+    if (!safeOld || !safeNew) return fail('Path is outside the vault')
+    if (safeOld === currentVault()) return fail('Cannot rename the vault itself')
+    if (safeOld === safeNew) return { ok: true }
+    if (existsSync(safeNew) && !sameInode(safeOld, safeNew)) {
+      return fail('Something with that name already exists')
+    }
     try {
       renameSync(safeOld, safeNew)
-      tagsService.renameFile(safeOld, safeNew)
-      broadcastTagIndex()
-      return true
-    } catch {
-      return false
-    }
-  })
-
-  ipcMain.handle('file:exists', async (_, path: string) => {
-    const safe = safeInsideVault(path)
-    if (!safe) return false
-    return existsSync(safe)
-  })
-
-  // Open an attachment with the OS default handler. Accepts ONLY
-  // vault-relative paths (e.g. "vault_media/foo.pdf"). Absolute paths
-  // are rejected outright so a crafted markdown link like
-  // `[Docs](/Applications/Evil.app)` can't launch arbitrary apps.
-  ipcMain.handle('attachment:open', async (_, target: string) => {
-    try {
-      // Reject absolute paths on any platform
-      if (
-        target.startsWith('/') ||
-        /^[a-zA-Z]:[/\\]/.test(target) ||
-        target.startsWith('\\\\')
-      ) {
-        return false
-      }
-      const vaultPath = mainStore.getState().settings.vaultPath
-      if (!vaultPath) return false
-      const candidate = join(vaultPath, decodeURI(target))
-      const safe = safeInsideVault(candidate)
-      if (!safe) return false
-      const errorMsg = await shell.openPath(safe)
-      return errorMsg === ''
+      tagsService.renamePath(safeOld, safeNew)
+      historyService.onPathRenamed(safeOld, safeNew)
+      movePath(safeOld, safeNew)
+      refreshTree()
+      broadcastIndex()
+      return { ok: true }
     } catch (error) {
-      console.error('Error opening attachment:', error)
-      return false
+      return fail(messageOf(error))
     }
   })
 
-  ipcMain.handle('shell:open-external', async (_, url: string) => {
-    if (!isSafeExternalUrl(url)) return
+  handle('folder:create', async (_, path) => {
+    const safe = safeInsideVault(path)
+    if (!safe) return fail('Path is outside the vault')
+    if (existsSync(safe)) return fail('A folder with that name already exists')
+    try {
+      mkdirSync(safe, { recursive: true })
+      refreshTree()
+      return { ok: true }
+    } catch (error) {
+      return fail(messageOf(error))
+    }
+  })
+
+  handle('folder:delete', async (_, path) => {
+    const safe = safeInsideVault(path)
+    if (!safe) return fail('Path is outside the vault')
+    if (safe === currentVault()) return fail('Cannot delete the vault itself')
+    try {
+      await trashPath(safe)
+      tagsService.removePath(safe)
+      historyService.onPathDeleted(safe)
+      forgetPath(safe)
+      refreshTree()
+      broadcastIndex()
+      return { ok: true }
+    } catch (error) {
+      return fail(`Could not move to Trash: ${messageOf(error)}`)
+    }
+  })
+
+  // --- Attachments and links -------------------------------------------
+
+  handle('attachment:save', async (_, sourcePath) => {
+    const vaultPath = currentVault()
+    if (!vaultPath) return fail('No vault is open')
+    if (typeof sourcePath !== 'string') return fail('Invalid source path')
+    try {
+      const saved = saveAttachment(vaultPath, sourcePath)
+      refreshTree()
+      return { ok: true, ...saved }
+    } catch (error) {
+      return fail(messageOf(error))
+    }
+  })
+
+  handle('attachment:open', async (_, target) => {
+    const vaultPath = currentVault()
+    if (!vaultPath) return fail('No vault is open')
+    if (typeof target !== 'string') return fail('Invalid path')
+    // Vault-relative paths only: a crafted `[x](/Applications/Evil.app)`
+    // must never resolve.
+    if (target.startsWith('/') || /^[a-zA-Z]:[/\\]/.test(target) || target.startsWith('\\\\')) {
+      return fail('Only vault-relative links can be opened')
+    }
+    let decoded = target
+    try {
+      decoded = decodeURI(target)
+    } catch {
+      /* keep raw */
+    }
+    const safe = safeInsideVault(join(vaultPath, decoded))
+    if (!safe || !existsSync(safe)) return fail('File not found in the vault')
+    try {
+      if (statSync(safe).isDirectory() || !OPENABLE_EXTENSIONS.has(extname(safe).toLowerCase())) {
+        shell.showItemInFolder(safe)
+        return { ok: true }
+      }
+      const errorMsg = await shell.openPath(safe)
+      return errorMsg ? fail(errorMsg) : { ok: true }
+    } catch (error) {
+      return fail(messageOf(error))
+    }
+  })
+
+  handle('shell:open-external', async (_, url) => {
+    if (typeof url !== 'string' || !isSafeExternalUrl(url)) return
     await shell.openExternal(url)
   })
 
-  // Attachment handler — copies an external source file into the
-  // vault's vault_media/ folder. Source path validation (reject
-  // symlinks, non-regular files, cross-platform basename) lives
-  // inside saveAttachmentToVault itself.
-  ipcMain.handle('attachment:save', async (_, sourcePath: string) => {
-    const vaultPath = mainStore.getState().settings.vaultPath
-    if (!vaultPath) return null
-    const result = saveAttachmentToVault(vaultPath, sourcePath)
-    if (result) {
-      const tree = buildFileTree(vaultPath)
-      mainStore.getState().setFileTree(tree)
-      BrowserWindow.getAllWindows().forEach((win) => {
-        win.webContents.send('store:state-changed', { fileTree: tree })
-      })
+  // --- Store ----------------------------------------------------------
+
+  handle('store:get-state', async () => {
+    const { settings, ui, fileTree } = mainStore.getState()
+    return { settings, ui, fileTree }
+  })
+
+  handle('store:set-theme', async (_, theme) => {
+    if (theme !== 'dark' && theme !== 'light') return
+    mainStore.getState().setTheme(theme)
+    broadcast('store:state-changed', { settings: { theme } })
+  })
+
+  handle('store:toggle-left-sidebar', async () => {
+    mainStore.getState().toggleLeftSidebar()
+    broadcast('store:state-changed', {
+      ui: { leftSidebarVisible: mainStore.getState().ui.leftSidebarVisible }
+    })
+  })
+
+  handle('store:toggle-right-sidebar', async () => {
+    mainStore.getState().toggleRightSidebar()
+    broadcast('store:state-changed', {
+      ui: { rightSidebarVisible: mainStore.getState().ui.rightSidebarVisible }
+    })
+  })
+
+  handle('store:set-sidebar-width', async (_, side, width) => {
+    if ((side !== 'left' && side !== 'right') || !Number.isFinite(width)) return
+    mainStore.getState().setSidebarWidth(side, Math.round(width))
+    const { leftSidebarWidth, rightSidebarWidth } = mainStore.getState().ui
+    broadcast('store:state-changed', { ui: { leftSidebarWidth, rightSidebarWidth } })
+  })
+
+  handle('store:set-font-size', async (_, size) => {
+    mainStore.getState().setFontSize(size)
+    broadcast('store:state-changed', { settings: { fontSize: size } })
+  })
+
+  handle('store:set-accent-color', async (_, color) => {
+    if (typeof color !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(color)) return
+    mainStore.getState().setAccentColor(color)
+    broadcast('store:state-changed', { settings: { accentColor: color } })
+  })
+
+  handle('store:toggle-folder-expanded', async (_, folderId) => {
+    mainStore.getState().toggleFolderExpanded(folderId)
+    broadcast('store:state-changed', {
+      ui: { expandedFolders: mainStore.getState().ui.expandedFolders }
+    })
+  })
+
+  handle('store:toggle-relation-expanded', async (_, filePath, tag) => {
+    mainStore.getState().toggleRelationExpanded(filePath, tag)
+    broadcast('store:state-changed', {
+      ui: { expandedRelations: mainStore.getState().ui.expandedRelations }
+    })
+  })
+
+  handle('store:set-section-expanded', async (_, sectionId, expanded) => {
+    mainStore.getState().setSectionExpanded(sectionId, Boolean(expanded))
+    broadcast('store:state-changed', {
+      ui: { sectionsExpanded: mainStore.getState().ui.sectionsExpanded }
+    })
+  })
+
+  handle('store:set-section-order', async (_, order) => {
+    if (!Array.isArray(order) || !order.every((id) => typeof id === 'string')) return
+    mainStore.getState().setSectionOrder(order)
+    broadcast('store:state-changed', { ui: { sectionOrder: mainStore.getState().ui.sectionOrder } })
+  })
+
+  handle('store:set-ai-model', async (_, model) => {
+    mainStore.getState().setAIModel(model)
+    broadcast('store:state-changed', { settings: { ai: mainStore.getState().settings.ai } })
+  })
+
+  handle('store:set-ai-system-prompt', async (_, prompt) => {
+    if (typeof prompt !== 'string') return
+    mainStore.getState().setAISystemPrompt(prompt)
+    broadcast('store:state-changed', { settings: { ai: mainStore.getState().settings.ai } })
+  })
+
+  handle('store:set-last-opened-file', async (_, path) => {
+    mainStore.getState().setLastOpenedFile(typeof path === 'string' ? path : null)
+  })
+
+  // --- Tags -----------------------------------------------------------
+
+  handle('tags:get-index', async () => tagsService.getSnapshot())
+  handle('tags:get-relations', async (_, filePath) => tagsService.getRelations(filePath))
+  handle('tags:get-graph', async () => tagsService.getTagGraph())
+
+  handle('tags:remove-tag', async (_, tag) => {
+    if (typeof tag !== 'string') return { filesModified: [], occurrencesRemoved: 0 }
+    const result = tagsService.removeTag(tag)
+    if (result.filesModified.length > 0) {
+      broadcastIndex()
+      notifyRewrites(result.filesModified, 'tag-removal')
     }
     return result
   })
 
-  // Folder handlers
-  ipcMain.handle('folder:create', async (_, path: string) => {
-    const safe = safeInsideVault(path)
-    if (!safe) return false
-    try {
-      mkdirSync(safe, { recursive: true })
-      return true
-    } catch {
-      return false
-    }
-  })
+  // --- History --------------------------------------------------------
 
-  ipcMain.handle('folder:delete', async (_, path: string) => {
-    const safe = safeInsideVault(path)
-    if (!safe) return false
-    try {
-      rmdirSync(safe, { recursive: true })
-      return true
-    } catch {
-      return false
-    }
-  })
-
-  ipcMain.handle('folder:list', async (_, path: string) => {
-    const safe = safeInsideVault(path)
-    if (!safe) return []
-    return buildFileTree(safe)
-  })
-
-  // Vault handlers
-  ipcMain.handle('vault:open', async (_, path: string) => {
-    // Migrate legacy `.arbetsyta/` app dir inside the vault, if present.
-    migrateVaultAppDir(path)
-    const tree = buildFileTree(path)
-    mainStore.getState().setFileTree(tree)
-    mainStore.getState().setVaultPath(path)
-    tagsService.scanVault(path)
-    historyService.setVaultPath(path)
-
-    // Notify all windows of the state change
-    BrowserWindow.getAllWindows().forEach((win) => {
-      win.webContents.send('store:state-changed', {
-        settings: { vaultPath: path },
-        fileTree: tree
-      })
-    })
-    broadcastTagIndex()
-
-    return tree
-  })
-
-  ipcMain.handle('vault:close', async () => {
-    mainStore.getState().setFileTree([])
-    mainStore.getState().setVaultPath(null)
-  })
-
-  ipcMain.handle('vault:init', async (_, path: string) => {
-    return initVaultStructure(path)
-  })
-
-  // History handlers — snapshot storage is *inside* the vault, so
-  // filePath must itself be vault-confined. snapshotId is a bare
-  // filename-safe string (validated by historyService).
-  ipcMain.handle('history:list', async (_, filePath: string) => {
+  handle('history:list', async (_, filePath) => {
     const safe = safeInsideVault(filePath)
-    if (!safe) return { filePath, snapshots: [] }
-    return historyService.list(safe)
+    return safe ? historyService.list(safe) : { filePath, snapshots: [] }
   })
 
-  ipcMain.handle('history:create-snapshot', async (_, filePath: string) => {
+  handle('history:create-snapshot', async (_, filePath) => {
     const safe = safeInsideVault(filePath)
     if (!safe) return null
-    const meta = historyService.createSnapshot(safe)
-    if (meta) broadcastHistoryChanged(safe)
+    const meta = historyService.createSnapshot(safe, 'manual')
+    if (meta) broadcast('history:changed', { filePath: safe })
     return meta
   })
 
-  ipcMain.handle(
-    'history:restore',
-    async (_, filePath: string, snapshotId: string) => {
-      const safe = safeInsideVault(filePath)
-      if (!safe) return null
-      const result = historyService.restore(safe, snapshotId)
-      if (result) {
-        tagsService.updateFile(safe, result.content)
-        tagsService.propagateTags(safe)
-        broadcastTagIndex()
-        broadcastHistoryChanged(safe)
-      }
-      return result
+  handle('history:restore', async (_, filePath, snapshotId) => {
+    const safe = safeInsideVault(filePath)
+    if (!safe) return fail('Path is outside the vault')
+    const content = historyService.readSnapshot(safe, snapshotId)
+    if (content === null) return fail('Snapshot not found')
+    try {
+      historyService.createSnapshot(safe, 'auto')
+      if (writeVaultFile(safe, content).changed) afterNoteChanged(safe, content)
+      broadcast('history:changed', { filePath: safe })
+      return { ok: true, content }
+    } catch (error) {
+      return fail(messageOf(error))
     }
+  })
+
+  handle('history:delete-snapshot', async (_, filePath, snapshotId) => {
+    const safe = safeInsideVault(filePath)
+    if (!safe) return fail('Path is outside the vault')
+    if (!historyService.deleteSnapshot(safe, snapshotId)) return fail('Snapshot not found')
+    broadcast('history:changed', { filePath: safe })
+    return { ok: true }
+  })
+
+  // --- Search ---------------------------------------------------------
+
+  handle('search:query', async (_, query, limit) =>
+    tagsService.search(typeof query === 'string' ? query : '', Number(limit))
   )
-
-  ipcMain.handle(
-    'history:delete-snapshot',
-    async (_, filePath: string, snapshotId: string) => {
-      const safe = safeInsideVault(filePath)
-      if (!safe) return false
-      const ok = historyService.deleteSnapshot(safe, snapshotId)
-      if (ok) broadcastHistoryChanged(safe)
-      return ok
-    }
-  )
-
-  // Tag index handlers
-  ipcMain.handle('tags:get-index', async () => {
-    return tagsService.getSnapshot()
-  })
-
-  ipcMain.handle('tags:get-relations', async (_, filePath: string) => {
-    return tagsService.getRelations(filePath)
-  })
-
-  ipcMain.handle(
-    'search:query',
-    async (_, query: string, limit: number) => {
-      return tagsService.search(query, limit)
-    }
-  )
-
-  ipcMain.handle('tags:get-graph', async () => {
-    return tagsService.getTagGraph()
-  })
-
-  ipcMain.handle('tags:rescan', async () => {
-    const vaultPath = mainStore.getState().settings.vaultPath
-    if (vaultPath) {
-      tagsService.scanVault(vaultPath)
-      broadcastTagIndex()
-    }
-    return tagsService.getSnapshot()
-  })
-
-  ipcMain.handle('tags:remove-tag', async (_, tag: string) => {
-    const result = tagsService.removeTag(tag)
-    if (result.filesModified.length > 0) {
-      broadcastTagIndex()
-      // Each modified file got a new history snapshot — surface it so
-      // any open History panel refreshes.
-      for (const filePath of result.filesModified) {
-        broadcastHistoryChanged(filePath)
-      }
-    }
-    return result
-  })
-
-  // Store handlers
-  ipcMain.handle('store:get-state', async () => {
-    const state = mainStore.getState()
-    return {
-      settings: state.settings,
-      ui: state.ui,
-      fileTree: state.fileTree
-    }
-  })
-
-  ipcMain.handle('store:set-vault-path', async (_, path: string | null) => {
-    mainStore.getState().setVaultPath(path)
-  })
-
-  ipcMain.handle('store:set-theme', async (_, theme: 'dark' | 'light') => {
-    mainStore.getState().setTheme(theme)
-    // Notify all windows of the theme change
-    BrowserWindow.getAllWindows().forEach((win) => {
-      win.webContents.send('store:state-changed', {
-        settings: { theme }
-      })
-    })
-  })
-
-  ipcMain.handle('store:toggle-left-sidebar', async () => {
-    mainStore.getState().toggleLeftSidebar()
-    const visible = mainStore.getState().ui.leftSidebarVisible
-    BrowserWindow.getAllWindows().forEach((win) => {
-      win.webContents.send('store:state-changed', {
-        ui: { leftSidebarVisible: visible }
-      })
-    })
-  })
-
-  ipcMain.handle('store:toggle-right-sidebar', async () => {
-    mainStore.getState().toggleRightSidebar()
-    const visible = mainStore.getState().ui.rightSidebarVisible
-    BrowserWindow.getAllWindows().forEach((win) => {
-      win.webContents.send('store:state-changed', {
-        ui: { rightSidebarVisible: visible }
-      })
-    })
-  })
-
-  ipcMain.handle('store:set-sidebar-width', async (_, side: 'left' | 'right', width: number) => {
-    if (side === 'left') {
-      mainStore.getState().setLeftSidebarWidth(width)
-    } else {
-      mainStore.getState().setRightSidebarWidth(width)
-    }
-    const ui = mainStore.getState().ui
-    BrowserWindow.getAllWindows().forEach((win) => {
-      win.webContents.send('store:state-changed', {
-        ui: {
-          leftSidebarWidth: ui.leftSidebarWidth,
-          rightSidebarWidth: ui.rightSidebarWidth
-        }
-      })
-    })
-  })
-
-  ipcMain.handle('store:set-font-size', async (_, size: FontSize) => {
-    mainStore.getState().setFontSize(size)
-    // Notify all windows of the font size change
-    BrowserWindow.getAllWindows().forEach((win) => {
-      win.webContents.send('store:state-changed', {
-        settings: { fontSize: size }
-      })
-    })
-  })
-
-  ipcMain.handle('store:toggle-folder-expanded', async (_, folderId: string) => {
-    mainStore.getState().toggleFolderExpanded(folderId)
-    const expandedFolders = mainStore.getState().ui.expandedFolders
-    BrowserWindow.getAllWindows().forEach((win) => {
-      win.webContents.send('store:state-changed', {
-        ui: { expandedFolders }
-      })
-    })
-  })
-
-  ipcMain.handle(
-    'store:toggle-relation-expanded',
-    async (_, filePath: string, tag: string) => {
-      mainStore.getState().toggleRelationExpanded(filePath, tag)
-      const expandedRelations = mainStore.getState().ui.expandedRelations
-      BrowserWindow.getAllWindows().forEach((win) => {
-        win.webContents.send('store:state-changed', {
-          ui: { expandedRelations }
-        })
-      })
-    }
-  )
-
-  ipcMain.handle(
-    'store:set-section-expanded',
-    async (_, sectionId: string, expanded: boolean) => {
-      mainStore.getState().setSectionExpanded(sectionId, expanded)
-      const sectionsExpanded = mainStore.getState().ui.sectionsExpanded
-      BrowserWindow.getAllWindows().forEach((win) => {
-        win.webContents.send('store:state-changed', {
-          ui: { sectionsExpanded }
-        })
-      })
-    }
-  )
-
-  ipcMain.handle(
-    'store:set-section-order',
-    async (_, order: string[]) => {
-      mainStore.getState().setSectionOrder(order)
-      const sectionOrder = mainStore.getState().ui.sectionOrder
-      BrowserWindow.getAllWindows().forEach((win) => {
-        win.webContents.send('store:state-changed', {
-          ui: { sectionOrder }
-        })
-      })
-    }
-  )
-
-  ipcMain.handle('store:set-accent-color', async (_, color: string) => {
-    mainStore.getState().setAccentColor(color)
-    // Notify all windows of the accent color change
-    BrowserWindow.getAllWindows().forEach((win) => {
-      win.webContents.send('store:state-changed', {
-        settings: { accentColor: color }
-      })
-    })
-  })
-
-  ipcMain.handle('store:set-ai-model', async (_, model: string | null) => {
-    mainStore.getState().setAIModel(model)
-    const ai = mainStore.getState().settings.ai
-    BrowserWindow.getAllWindows().forEach((win) => {
-      win.webContents.send('store:state-changed', {
-        settings: { ai }
-      })
-    })
-  })
-
-  ipcMain.handle('store:set-ai-system-prompt', async (_, prompt: string) => {
-    mainStore.getState().setAISystemPrompt(prompt)
-    const ai = mainStore.getState().settings.ai
-    BrowserWindow.getAllWindows().forEach((win) => {
-      win.webContents.send('store:state-changed', {
-        settings: { ai }
-      })
-    })
-  })
 
   // --- AI (Ollama) ------------------------------------------------------
 
-  ipcMain.handle('ai:list-models', async () => {
-    return listModels()
+  handle('ai:list-models', async () => listModels())
+
+  // In-flight streams so the user can cancel. Capped so a bug can never
+  // fan out into hundreds of parallel requests.
+  const activeChats = new Map<string, AbortController>()
+  const MAX_CONCURRENT_CHATS = 5
+  // Deltas are coalesced into ~40 ms batches: one IPC message and one
+  // render per batch instead of one per token.
+  const CHUNK_FLUSH_MS = 40
+
+  handle('ai:chat-start', async (event, requestId, model, messages) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    const reject = (message: string): void => sendTo(win, 'ai:chat-error', { requestId, message })
+    if (typeof requestId !== 'string' || requestId.length === 0 || requestId.length > 64) return
+    if (typeof model !== 'string' || !Array.isArray(messages)) return reject('Invalid chat request')
+    if (activeChats.has(requestId)) return reject('Duplicate chat request')
+    if (activeChats.size >= MAX_CONCURRENT_CHATS) return reject('Too many concurrent chat requests')
+
+    const controller = new AbortController()
+    activeChats.set(requestId, controller)
+
+    let pending = ''
+    let flushTimer: ReturnType<typeof setTimeout> | null = null
+    const flush = (): void => {
+      flushTimer = null
+      if (!pending) return
+      sendTo(win, 'ai:chat-chunk', { requestId, delta: pending })
+      pending = ''
+    }
+    const finish = (): void => {
+      if (flushTimer) clearTimeout(flushTimer)
+      flush()
+      activeChats.delete(requestId)
+    }
+
+    void streamChat(
+      model,
+      messages as ChatMessageSend[],
+      controller.signal,
+      (delta) => {
+        pending += delta
+        if (!flushTimer) flushTimer = setTimeout(flush, CHUNK_FLUSH_MS)
+      },
+      () => {
+        finish()
+        sendTo(win, 'ai:chat-done', { requestId })
+      },
+      (message) => {
+        finish()
+        reject(message)
+      }
+    )
   })
 
-  // Track in-flight chat streams so users can cancel.
-  const activeChats = new Map<string, AbortController>()
-  // Concurrency cap — prevents a rogue renderer (or a bug) from
-  // spamming Ollama with thousands of parallel chat requests,
-  // exhausting sockets, memory, or listener counts.
-  const MAX_CONCURRENT_CHATS = 5
-
-  ipcMain.handle(
-    'ai:chat-start',
-    async (
-      event,
-      requestId: string,
-      model: string,
-      messages: ChatMessageSend[]
-    ) => {
-      const senderWin = BrowserWindow.fromWebContents(event.sender)
-      if (activeChats.size >= MAX_CONCURRENT_CHATS) {
-        senderWin?.webContents.send('ai:chat-error', {
-          requestId,
-          message: 'Too many concurrent chat requests'
-        })
-        return
-      }
-      const controller = new AbortController()
-      activeChats.set(requestId, controller)
-      // Fire-and-forget — streamChat emits chunks via events.
-      streamChat(
-        model,
-        messages,
-        controller.signal,
-        (delta) => {
-          senderWin?.webContents.send('ai:chat-chunk', { requestId, delta })
-        },
-        () => {
-          senderWin?.webContents.send('ai:chat-done', { requestId })
-          activeChats.delete(requestId)
-        },
-        (message) => {
-          senderWin?.webContents.send('ai:chat-error', { requestId, message })
-          activeChats.delete(requestId)
-        }
-      )
-    }
-  )
-
-  ipcMain.handle('ai:chat-abort', async (_, requestId: string) => {
-    const ctrl = activeChats.get(requestId)
-    if (ctrl) {
-      ctrl.abort()
+  handle('ai:chat-abort', async (_, requestId) => {
+    const controller = activeChats.get(requestId)
+    if (controller) {
+      controller.abort()
       activeChats.delete(requestId)
     }
   })
-}
-
-// Send state updates to renderer
-export function sendStateUpdate(
-  win: BrowserWindow,
-  update: { settings?: object; ui?: object; fileTree?: FileNode[] }
-): void {
-  win.webContents.send('store:state-changed', update)
 }

@@ -1,12 +1,15 @@
-// Store state shape for the application
+// State shapes shared by the main-process store and the renderer mirror.
+
+export type Theme = 'dark' | 'light'
 
 export interface FileNode {
+  /** Vault-relative path with `/` separators; stable across restarts. */
   id: string
   name: string
+  /** Absolute path on disk. */
   path: string
   type: 'file' | 'folder'
   children?: FileNode[]
-  modifiedAt?: number
 }
 
 export type FontSize = 'xs' | 'sm' | 'md' | 'lg' | 'xl'
@@ -22,13 +25,12 @@ export interface AISettings {
 
 export interface AppSettings {
   vaultPath: string | null
-  theme: 'dark' | 'light'
+  theme: Theme
   fontSize: FontSize
   accentColor: string
   ai: AISettings
 }
 
-// Font size pixel values
 export const fontSizeValues: Record<FontSize, number> = {
   xs: 13,
   sm: 14,
@@ -50,6 +52,7 @@ export interface UIState {
   rightSidebarVisible: boolean
   leftSidebarWidth: number
   rightSidebarWidth: number
+  /** Reopened on launch when it still exists. */
   lastOpenedFile: string | null
   expandedFolders: string[]
   // Per-file map of expanded relation tag names in the right sidebar.
@@ -66,48 +69,28 @@ export interface UIState {
   sectionOrder: string[]
 }
 
-export interface EditorState {
-  currentFile: string | null
-  content: string
-  isDirty: boolean
-}
-
-export interface MainStore {
-  // Settings - persisted to ~/.rune/settings.json
+/** What `store:get-state` returns and what the renderer mirrors. */
+export interface StoreSnapshot {
   settings: AppSettings
-
-  // UI state - persisted to ~/.rune/ui-state.json
   ui: UIState
-
-  // File tree - rebuilt from disk on vault load
   fileTree: FileNode[]
-
-  // Editor state - in-memory only
-  editor: EditorState
-
-  // Actions
-  setVaultPath: (path: string | null) => void
-  setTheme: (theme: 'dark' | 'light') => void
-  setFontSize: (size: FontSize) => void
-  setAccentColor: (color: string) => void
-  setAIModel: (model: string | null) => void
-  setAISystemPrompt: (prompt: string) => void
-  toggleLeftSidebar: () => void
-  toggleRightSidebar: () => void
-  setLeftSidebarWidth: (width: number) => void
-  setRightSidebarWidth: (width: number) => void
-  toggleFolderExpanded: (folderId: string) => void
-  toggleRelationExpanded: (filePath: string, tag: string) => void
-  setSectionExpanded: (sectionId: string, expanded: boolean) => void
-  setSectionOrder: (order: string[]) => void
-  setFileTree: (tree: FileNode[]) => void
-  openFile: (path: string, content: string) => void
-  updateEditorContent: (content: string) => void
-  markClean: () => void
-  closeFile: () => void
 }
 
-// Default values
+/** Partial update pushed from main via `store:state-changed`. */
+export interface StateUpdate {
+  settings?: Partial<AppSettings>
+  ui?: Partial<UIState>
+  fileTree?: FileNode[]
+}
+
+export interface DocumentStats {
+  wordCount: number
+  characterCount: number
+  readingTimeMinutes: number
+  paragraphs: number
+  sentences: number
+}
+
 export const DEFAULT_AI_SYSTEM_PROMPT = `You are a thoughtful writing companion for the markdown document provided below. Be concise, reference specific passages when relevant, and match the document's existing voice and language. When the user asks about something not in the document, answer briefly from general knowledge but make it clear you're stepping outside the document.
 
 ---
@@ -137,10 +120,4 @@ export const defaultUIState: UIState = {
   expandedRelations: {},
   sectionsExpanded: {},
   sectionOrder: []
-}
-
-export const defaultEditorState: EditorState = {
-  currentFile: null,
-  content: '',
-  isDirty: false
 }

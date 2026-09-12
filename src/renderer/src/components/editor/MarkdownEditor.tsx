@@ -1,216 +1,96 @@
-import { useEffect, useCallback, useRef, forwardRef, useImperativeHandle, useState } from 'react'
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useState } from 'react'
+import type { Result } from '@shared/ipc'
 import { useCodeMirror } from '@/editor/useCodeMirror'
 
-const IMAGE_EXTENSIONS = new Set([
-  '.png',
-  '.jpg',
-  '.jpeg',
-  '.gif',
-  '.webp',
-  '.svg',
-  '.bmp',
-  '.avif'
-])
+const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.avif'])
 
 interface MarkdownEditorProps {
-  value: string
+  /** Text to mount with. Remount (change the key) to show another document. */
+  initialValue: string
   onChange: (value: string) => void
-  onCursorChange?: (line: number, column: number) => void
-  onSave?: () => void
-  onDropFile?: (sourcePath: string) => Promise<{
-    filename: string
-    relativePath: string
-  } | null>
-  placeholder?: string
-  readOnly?: boolean
-  autoFocus?: boolean
+  onCursorChange: (line: number, column: number) => void
+  onDropFile: (sourcePath: string) => Promise<Result<{ filename: string; relativePath: string }>>
 }
 
 export interface MarkdownEditorHandle {
   getValue: () => string
+  getCaret: () => number
   focus: () => void
 }
 
-export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorProps>(function MarkdownEditor({
-  value,
-  onChange,
-  onCursorChange,
-  onSave,
-  onDropFile,
-  placeholder = 'Start writing...',
-  readOnly = false,
-  autoFocus = true
-}, ref) {
-  const [isDragOver, setIsDragOver] = useState(false)
-  const onSaveRef = useRef(onSave)
+export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorProps>(
+  function MarkdownEditor({ initialValue, onChange, onCursorChange, onDropFile }, ref) {
+    const [isDragOver, setIsDragOver] = useState(false)
+    const { containerRef, viewRef, getValue, getCaret, focus } = useCodeMirror({
+      initialValue,
+      onChange,
+      onCursorChange
+    })
 
-  useEffect(() => {
-    onSaveRef.current = onSave
-  }, [onSave])
-  const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+    useImperativeHandle(ref, () => ({ getValue, getCaret, focus }), [getValue, getCaret, focus])
 
-  // Debounced auto-save. Reads the latest onSave from the ref so the
-  // closure here can never go stale.
-  //
-  // 2.5s (was 1s) — longer debounce means fewer writes per minute,
-  // which is friendlier to cloud-sync daemons (pCloud, OneDrive, iCloud,
-  // Proton Drive): every write is a chance for the daemon to upload
-  // mid-change and create a "conflicted copy". We still save eagerly on
-  // blur / visibilitychange / beforeunload / Cmd+S / file-switch, so
-  // the worst-case data loss on crash is ≤2.5s of typing.
-  const handleChange = useCallback(
-    (newValue: string) => {
-      onChange(newValue)
+    useEffect(() => {
+      const timer = setTimeout(focus, 50)
+      return () => clearTimeout(timer)
+    }, [focus])
 
-      if (saveTimeoutRef.current) {
-        clearTimeout(saveTimeoutRef.current)
-      }
-
-      saveTimeoutRef.current = setTimeout(() => {
-        onSaveRef.current?.()
-      }, 2500)
-    },
-    [onChange]
-  )
-
-  const { containerRef, view, focus, getValue } = useCodeMirror({
-    initialValue: value,
-    placeholder,
-    onChange: handleChange,
-    onCursorChange,
-    readOnly
-  })
-
-  const handleDragOver = useCallback((e: React.DragEvent) => {
-    if (!onDropFile || readOnly) return
-    // Only react to OS-level file drags (not text selection drags)
-    if (!Array.from(e.dataTransfer.types).includes('Files')) return
-    e.preventDefault()
-    e.dataTransfer.dropEffect = 'copy'
-    setIsDragOver(true)
-  }, [onDropFile, readOnly])
-
-  const handleDragLeave = useCallback((e: React.DragEvent) => {
-    if (e.currentTarget === e.target) setIsDragOver(false)
-  }, [])
-
-  const handleDrop = useCallback(
-    async (e: React.DragEvent) => {
-      if (!onDropFile || readOnly) return
-      const files = Array.from(e.dataTransfer.files)
-      if (files.length === 0) return
+    const handleDragOver = useCallback((e: React.DragEvent) => {
+      // Only react to OS-level file drags (not text selection drags).
+      if (!Array.from(e.dataTransfer.types).includes('Files')) return
       e.preventDefault()
-      setIsDragOver(false)
+      e.dataTransfer.dropEffect = 'copy'
+      setIsDragOver(true)
+    }, [])
 
-      const snippets: string[] = []
-      for (const file of files) {
-        // Electron 28+ exposes absolute drop paths via preload's webUtils wrapper
-        const sourcePath = window.api.getFilePath(file)
-        if (!sourcePath) continue
-        const result = await onDropFile(sourcePath)
-        if (!result) continue
-        const ext = result.filename.slice(result.filename.lastIndexOf('.')).toLowerCase()
-        const isImage = IMAGE_EXTENSIONS.has(ext)
-        const name = result.filename.slice(0, ext.length ? -ext.length : undefined)
-        // encodeURI preserves "/" while escaping spaces and unicode —
-        // required for the markdown parser to see a valid link destination.
-        const link = encodeURI(result.relativePath)
-        snippets.push(isImage ? `![${name}](${link})` : `[${name}](${link})`)
-      }
+    const handleDragLeave = useCallback((e: React.DragEvent) => {
+      if (e.currentTarget === e.target) setIsDragOver(false)
+    }, [])
 
-      if (snippets.length === 0) return
-
-      const currentView = view
-      if (!currentView) return
-      const pos = currentView.state.selection.main.head
-      const insert = `${snippets.join('\n')}\n`
-      currentView.dispatch({
-        changes: { from: pos, to: pos, insert },
-        selection: { anchor: pos + insert.length }
-      })
-      currentView.focus()
-    },
-    [onDropFile, readOnly, view]
-  )
-
-  // Expose getValue and focus to parent via ref
-  useImperativeHandle(ref, () => ({
-    getValue,
-    focus
-  }), [getValue, focus])
-
-  // Auto-focus on mount
-  useEffect(() => {
-    if (!autoFocus || !view) return
-    const timer = setTimeout(() => {
-      focus()
-    }, 100)
-    return () => clearTimeout(timer)
-  }, [autoFocus, view, focus])
-
-  // Cleanup timeout on unmount
-  useEffect(() => {
-    return () => {
-      if (saveTimeoutRef.current) {
-        clearTimeout(saveTimeoutRef.current)
-      }
-    }
-  }, [])
-
-  // Handle keyboard shortcuts — always dispatches to the latest onSave
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+    const handleDrop = useCallback(
+      async (e: React.DragEvent) => {
+        const files = Array.from(e.dataTransfer.files)
+        if (files.length === 0) return
         e.preventDefault()
-        if (saveTimeoutRef.current) {
-          clearTimeout(saveTimeoutRef.current)
+        setIsDragOver(false)
+
+        const snippets: string[] = []
+        for (const file of files) {
+          const sourcePath = window.api.getFilePath(file)
+          if (!sourcePath) continue
+          const result = await onDropFile(sourcePath)
+          if (!result.ok) continue
+          const ext = result.filename.slice(result.filename.lastIndexOf('.')).toLowerCase()
+          const name = result.filename.slice(0, ext.length ? -ext.length : undefined)
+          // encodeURI keeps "/" while escaping spaces and unicode, which
+          // the markdown parser needs to see a valid link destination.
+          const link = encodeURI(result.relativePath)
+          snippets.push(IMAGE_EXTENSIONS.has(ext) ? `![${name}](${link})` : `[${name}](${link})`)
         }
-        onSaveRef.current?.()
-      }
-    }
+        if (snippets.length === 0) return
 
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [])
+        const view = viewRef.current
+        if (!view) return
+        const pos = view.state.selection.main.head
+        const insert = `${snippets.join('\n')}\n`
+        view.dispatch({
+          changes: { from: pos, to: pos, insert },
+          selection: { anchor: pos + insert.length }
+        })
+        view.focus()
+      },
+      [onDropFile, viewRef]
+    )
 
-  // Save eagerly when the window loses focus or the page is hidden.
-  // Cheap insurance against data loss if the user Cmd+Tabs away or quits
-  // before the autosave debounce fires.
-  useEffect(() => {
-    const flush = () => {
-      if (saveTimeoutRef.current) {
-        clearTimeout(saveTimeoutRef.current)
-        saveTimeoutRef.current = undefined
-      }
-      onSaveRef.current?.()
-    }
-    const onVisibility = () => {
-      if (document.visibilityState === 'hidden') flush()
-    }
-    window.addEventListener('blur', flush)
-    document.addEventListener('visibilitychange', onVisibility)
-    window.addEventListener('beforeunload', flush)
-    return () => {
-      window.removeEventListener('blur', flush)
-      document.removeEventListener('visibilitychange', onVisibility)
-      window.removeEventListener('beforeunload', flush)
-    }
-  }, [])
-
-  return (
-    <div
-      ref={containerRef}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
-      className={`h-full w-full overflow-auto focus-within:outline-none relative ${
-        isDragOver ? 'editor-drop-target' : ''
-      }`}
-      style={
-        {
-          '--editor-font-size': '16px'
-        } as React.CSSProperties
-      }
-    />
-  )
-})
+    return (
+      <div
+        ref={containerRef}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+        className={`h-full w-full overflow-auto focus-within:outline-none relative ${
+          isDragOver ? 'editor-drop-target' : ''
+        }`}
+      />
+    )
+  }
+)

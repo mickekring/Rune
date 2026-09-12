@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import { useEscapeKey } from '@/hooks/useEscapeKey'
 
 export interface ContextMenuItem {
   label: string
@@ -17,47 +18,27 @@ interface ContextMenuProps {
 
 export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null)
+  useEscapeKey(true, onClose)
 
   useEffect(() => {
-    const handleClickOutside = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        onClose()
-      }
+    const handleClickOutside = (e: MouseEvent): void => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) onClose()
     }
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        onClose()
-      }
-    }
-
-    // Delay adding listener to prevent immediate close
-    const timer = setTimeout(() => {
-      document.addEventListener('mousedown', handleClickOutside)
-      document.addEventListener('keydown', handleKeyDown)
-    }, 0)
-
+    // Delay so the opening right-click does not immediately close it.
+    const timer = setTimeout(() => document.addEventListener('mousedown', handleClickOutside), 0)
     return () => {
       clearTimeout(timer)
       document.removeEventListener('mousedown', handleClickOutside)
-      document.removeEventListener('keydown', handleKeyDown)
     }
   }, [onClose])
 
-  // Adjust position if menu would go off screen
+  // Keep the menu on screen.
   useEffect(() => {
-    if (menuRef.current) {
-      const rect = menuRef.current.getBoundingClientRect()
-      const viewportWidth = window.innerWidth
-      const viewportHeight = window.innerHeight
-
-      if (rect.right > viewportWidth) {
-        menuRef.current.style.left = `${x - rect.width}px`
-      }
-      if (rect.bottom > viewportHeight) {
-        menuRef.current.style.top = `${y - rect.height}px`
-      }
-    }
+    const el = menuRef.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    if (rect.right > window.innerWidth) el.style.left = `${x - rect.width}px`
+    if (rect.bottom > window.innerHeight) el.style.top = `${y - rect.height}px`
   }, [x, y])
 
   return (
@@ -65,11 +46,13 @@ export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
       ref={menuRef}
       className="fixed z-50 min-w-[160px] bg-background border border-border rounded-lg shadow-xl py-1 overflow-hidden"
       style={{ left: x, top: y }}
+      role="menu"
     >
-      {items.map((item, index) => (
-        <div key={index}>
+      {items.map((item) => (
+        <div key={item.label}>
           {item.divider && <div className="h-px bg-border my-1" />}
           <button
+            role="menuitem"
             className={`w-full px-3 py-1.5 text-sm text-left flex items-center gap-2 transition-colors ${
               item.variant === 'destructive'
                 ? 'text-destructive hover:bg-destructive/10'
@@ -80,7 +63,7 @@ export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
               onClose()
             }}
           >
-            {item.icon && <span className="w-4 h-4">{item.icon}</span>}
+            {item.icon && <span className="w-4 h-4 flex items-center justify-center">{item.icon}</span>}
             {item.label}
           </button>
         </div>

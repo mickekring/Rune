@@ -1,25 +1,18 @@
 import { app } from 'electron'
 import { join } from 'path'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
+import { APP_DIR_NAME } from '@shared/constants'
 import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-  renameSync
-} from 'fs'
-import type { AppSettings, UIState } from '@shared/types/store'
-import { defaultSettings, defaultUIState } from '@shared/types/store'
+  defaultSettings,
+  defaultUIState,
+  type AppSettings,
+  type UIState
+} from '@shared/types/store'
 
-// App data directory — renamed from `.arbetsyta` to `.rune` when the
-// app was rebranded. Existing installs get a silent one-time rename.
-export const APP_DIR_NAME = '.rune'
-const LEGACY_APP_DIR_NAMES = ['.arbetsyta']
-
-// Lazy initialization to avoid calling app.getPath before app is ready
-let configDir: string | null = null
-let settingsFile: string | null = null
-let uiStateFile: string | null = null
-let windowStateFile: string | null = null
+// Persistence for ~/.rune/{settings,ui-state,window-state}.json.
+// Writes go through a sibling temp file plus rename so a crash mid-write
+// can never leave a truncated file behind (the cloud-sync reasons for
+// avoiding rename in the vault do not apply to the home directory).
 
 export interface WindowBounds {
   width: number
@@ -28,137 +21,86 @@ export interface WindowBounds {
   y?: number
 }
 
-const defaultWindowBounds: WindowBounds = {
-  width: 1400,
-  height: 900
-}
+const defaultWindowBounds: WindowBounds = { width: 1400, height: 900 }
 
+let configDir: string | null = null
+
+// RUNE_CONFIG_DIR overrides ~/.rune so a second profile (tests, a trial
+// vault) can run without touching the real settings.
 function getConfigDir(): string {
   if (!configDir) {
-    const home = app.getPath('home')
-    configDir = join(home, APP_DIR_NAME)
-    // One-time migration: if the new dir doesn't exist but a legacy
-    // one does, rename it so the user keeps all their settings.
-    if (!existsSync(configDir)) {
-      for (const legacy of LEGACY_APP_DIR_NAMES) {
-        const legacyDir = join(home, legacy)
-        if (existsSync(legacyDir)) {
-          try {
-            renameSync(legacyDir, configDir)
-            console.log(
-              `Migrated config directory ${legacyDir} -> ${configDir}`
-            )
-          } catch (error) {
-            console.error(
-              `Failed to migrate ${legacyDir} -> ${configDir}:`,
-              error
-            )
-          }
-          break
-        }
-      }
-    }
+    configDir = process.env['RUNE_CONFIG_DIR'] || join(app.getPath('home'), APP_DIR_NAME)
   }
   return configDir
 }
 
-// Exposed so other services (history, vault init) can mirror the same
-// naming + migration convention per-vault.
-export function migrateVaultAppDir(vaultPath: string): string {
-  const target = join(vaultPath, APP_DIR_NAME)
-  if (!existsSync(target)) {
-    for (const legacy of LEGACY_APP_DIR_NAMES) {
-      const legacyDir = join(vaultPath, legacy)
-      if (existsSync(legacyDir)) {
-        try {
-          renameSync(legacyDir, target)
-        } catch (error) {
-          console.error(
-            `Failed to migrate vault app dir ${legacyDir} -> ${target}:`,
-            error
-          )
-        }
-        break
-      }
-    }
-  }
-  return target
-}
-
-function getSettingsFile(): string {
-  if (!settingsFile) {
-    settingsFile = join(getConfigDir(), 'settings.json')
-  }
-  return settingsFile
-}
-
-function getUIStateFile(): string {
-  if (!uiStateFile) {
-    uiStateFile = join(getConfigDir(), 'ui-state.json')
-  }
-  return uiStateFile
-}
-
-function getWindowStateFile(): string {
-  if (!windowStateFile) {
-    windowStateFile = join(getConfigDir(), 'window-state.json')
-  }
-  return windowStateFile
-}
-
 function ensureConfigDir(): void {
   const dir = getConfigDir()
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true })
-  }
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 })
 }
 
-function readJSON<T>(filePath: string, defaults: T): T {
+function fileIn(name: string): string {
+  return join(getConfigDir(), name)
+}
+
+function readObject(path: string): Record<string, unknown> | null {
   try {
-    if (existsSync(filePath)) {
-      const data = readFileSync(filePath, 'utf-8')
-      return { ...defaults, ...JSON.parse(data) }
+    if (!existsSync(path)) return null
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'))
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>
     }
+    console.error(`Ignoring malformed ${path}`)
   } catch (error) {
-    console.error(`Error reading ${filePath}:`, error)
+    console.error(`Error reading ${path}:`, error)
   }
-  return defaults
+  return null
 }
 
-function writeJSON<T>(filePath: string, data: T): void {
+function writeJSON(path: string, data: unknown): void {
   try {
     ensureConfigDir()
-    writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8')
+    const tmp = `${path}.${process.pid}.tmp`
+    writeFileSync(tmp, JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: 0o600 })
+    renameSync(tmp, path)
   } catch (error) {
-    console.error(`Error writing ${filePath}:`, error)
+    console.error(`Error writing ${path}:`, error)
   }
 }
 
 export const settingsService = {
   loadSettings(): AppSettings {
     ensureConfigDir()
-    return readJSON(getSettingsFile(), defaultSettings)
+    const parsed = readObject(fileIn('settings.json'))
+    if (!parsed) return defaultSettings
+    const ai =
+      parsed.ai && typeof parsed.ai === 'object'
+        ? { ...defaultSettings.ai, ...(parsed.ai as object) }
+        : defaultSettings.ai
+    return { ...defaultSettings, ...parsed, ai } as AppSettings
   },
 
   saveSettings(settings: AppSettings): void {
-    writeJSON(getSettingsFile(), settings)
+    writeJSON(fileIn('settings.json'), settings)
   },
 
   loadUIState(): UIState {
     ensureConfigDir()
-    return readJSON(getUIStateFile(), defaultUIState)
+    const parsed = readObject(fileIn('ui-state.json'))
+    return parsed ? ({ ...defaultUIState, ...parsed } as UIState) : defaultUIState
   },
 
   saveUIState(state: UIState): void {
-    writeJSON(getUIStateFile(), state)
+    writeJSON(fileIn('ui-state.json'), state)
   },
 
   loadWindowBounds(): WindowBounds {
     ensureConfigDir()
-    return readJSON(getWindowStateFile(), defaultWindowBounds)
+    const parsed = readObject(fileIn('window-state.json'))
+    return parsed ? ({ ...defaultWindowBounds, ...parsed } as WindowBounds) : defaultWindowBounds
   },
 
   saveWindowBounds(bounds: WindowBounds): void {
-    writeJSON(getWindowStateFile(), bounds)
+    writeJSON(fileIn('window-state.json'), bounds)
   }
 }

@@ -1,8 +1,5 @@
 @import "tailwindcss";
 
-/* Dark mode variant using class strategy */
-@custom-variant dark (&:where(.dark, .dark *));
-
 /* Theme CSS variables */
 @theme {
   /* Colors - Dark mode (default) - Obsidian-inspired */
@@ -23,12 +20,9 @@
   --color-warning: #ff9800;
   --color-destructive: #f44336;
 
-  /* Typography - Using system fonts for local-first, offline support */
+  /* Typography - system fonts for local-first, offline support */
   --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
   --font-mono: "SF Mono", "Menlo", "Monaco", "Consolas", monospace;
-
-  /* Spacing */
-  --spacing-sidebar-header: 52px;
 
   /* Animations */
   --transition-fast: 100ms;
@@ -36,7 +30,7 @@
   --transition-slow: 250ms;
 }
 
-/* Light mode overrides */
+/* Light mode overrides (toggled via .light on the root element) */
 .light {
   --color-background: #fafafa;
   --color-foreground: #171717;
@@ -107,7 +101,7 @@ body {
   background: color-mix(in srgb, var(--color-primary) 35%, transparent);
 }
 
-/* Resize handle styling */
+/* Resize handle */
 .resize-handle {
   position: relative;
   flex-shrink: 0;
@@ -131,16 +125,6 @@ body {
   background: var(--color-primary);
 }
 
-/* Sidebar collapse animation */
-.sidebar-content {
-  transition: opacity var(--transition-base) ease;
-}
-
-.sidebar-collapsed .sidebar-content {
-  opacity: 0;
-  pointer-events: none;
-}
-
 /* Subtle fade-in animation */
 @keyframes fadeIn {
   from { opacity: 0; }
@@ -161,7 +145,7 @@ body {
   animation: pulse-subtle 2s ease-in-out infinite;
 }
 
-/* File tree item hover effect */
+/* File tree rows */
 .file-tree-item {
   position: relative;
   transition: background-color var(--transition-fast) ease;
@@ -179,7 +163,7 @@ body {
   color: var(--color-foreground);
 }
 
-/* Inline #tag tokens — colored, subtle background, clickable feel */
+/* Inline #tag tokens */
 .cm-tag {
   color: var(--color-primary);
   background: color-mix(in srgb, var(--color-primary) 12%, transparent);
@@ -194,14 +178,11 @@ body {
   background: color-mix(in srgb, var(--color-primary) 24%, transparent);
 }
 
-/* AI chat — rendered markdown inside message bubbles.
-   Kept tight to fit the narrow sidebar; avoids react-markdown's default
-   wide paragraph spacing. */
+/* AI chat — rendered markdown inside message bubbles, kept tight for the
+   narrow sidebar. */
 .chat-markdown > *:first-child { margin-top: 0; }
 .chat-markdown > *:last-child  { margin-bottom: 0; }
-.chat-markdown p {
-  margin: 0 0 0.5em 0;
-}
+.chat-markdown p { margin: 0 0 0.5em 0; }
 .chat-markdown p:last-child { margin-bottom: 0; }
 .chat-markdown strong { font-weight: 600; color: var(--color-foreground); }
 .chat-markdown em     { font-style: italic; }
@@ -353,8 +334,7 @@ body {
   background: color-mix(in srgb, var(--color-primary) 6%, transparent);
 }
 
-/* Folder icons — filled with accent color for strong visual
-   differentiation from outlined file icons. */
+/* Folder icons — filled with the accent color */
 .folder-icon {
   color: var(--color-primary);
   opacity: 0.9;
@@ -366,11 +346,6 @@ body {
   opacity: 1;
 }
 
-/* Monospace text utility */
-.font-mono {
-  font-family: var(--font-mono);
-}
-
 /* Button base styles */
 .btn-ghost {
   background: transparent;
@@ -379,7 +354,7 @@ body {
   padding: 4px 8px;
   border-radius: 4px;
   color: var(--color-muted-foreground);
-  transition: all var(--transition-fast) ease;
+  transition: background-color var(--transition-fast) ease, color var(--transition-fast) ease;
 }
 
 .btn-ghost:hover {
@@ -391,50 +366,4 @@ body {
 :focus-visible {
   outline: 2px solid var(--color-primary);
   outline-offset: 2px;
-}
-
-/* Range slider styling */
-input[type="range"] {
-  -webkit-appearance: none;
-  appearance: none;
-  background: transparent;
-  cursor: pointer;
-}
-
-input[type="range"]::-webkit-slider-runnable-track {
-  background: var(--color-muted);
-  height: 6px;
-  border-radius: 3px;
-}
-
-input[type="range"]::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 16px;
-  height: 16px;
-  background: var(--color-accent);
-  border-radius: 50%;
-  margin-top: -5px;
-  border: 2px solid var(--color-background);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
-  transition: transform var(--transition-fast) ease;
-}
-
-input[type="range"]::-webkit-slider-thumb:hover {
-  transform: scale(1.1);
-}
-
-input[type="range"]::-moz-range-track {
-  background: var(--color-muted);
-  height: 6px;
-  border-radius: 3px;
-}
-
-input[type="range"]::-moz-range-thumb {
-  width: 16px;
-  height: 16px;
-  background: var(--color-accent);
-  border-radius: 50%;
-  border: 2px solid var(--color-background);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
 }

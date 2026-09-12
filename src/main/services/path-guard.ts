@@ -1,54 +1,59 @@
-import { realpathSync, existsSync } from 'fs'
+import { existsSync, realpathSync } from 'fs'
 import { basename, dirname, resolve, sep } from 'path'
 import { mainStore } from '../store'
 
 /**
- * Confine a renderer-supplied path to the currently-open vault.
+ * Resolve `userPath` and confirm it lives inside `rootReal` (which must
+ * itself already be a realpath). Symlinks are resolved, so a link that
+ * points out of the vault is rejected. Targets that do not exist yet are
+ * resolved through their nearest existing ancestor so writes can be
+ * validated before they happen.
  *
- * Returns the resolved absolute path if it's inside the vault root;
- * throws otherwise. Resolves symlinks via realpathSync so an attacker
- * can't sneak out via symlink indirection.
- *
- * For paths that don't exist yet (file:create, file:write, history
- * snapshots), falls back to resolving the parent directory — so we
- * can validate *future* writes without crashing realpath.
+ * Pure with respect to Electron: only the filesystem is consulted, which
+ * keeps it unit-testable with a temp directory.
  */
-export function assertInsideVault(userPath: string): string {
-  const vault = mainStore.getState().settings.vaultPath
-  if (!vault) {
-    throw new Error('Path rejected: no vault open')
+export function resolveInsideRoot(userPath: string, rootReal: string): string | null {
+  if (typeof userPath !== 'string' || userPath.length === 0 || userPath.includes('\0')) {
+    return null
   }
-
-  const vaultReal = realpathSync(resolve(vault))
   const absolute = resolve(userPath)
-
   let targetReal: string
-  if (existsSync(absolute)) {
-    targetReal = realpathSync(absolute)
-  } else {
-    // Target doesn't exist yet — resolve the parent dir (which must
-    // exist or be inside the vault) and re-attach the basename.
-    const parent = dirname(absolute)
-    if (existsSync(parent)) {
-      targetReal = resolve(realpathSync(parent), basename(absolute))
+  try {
+    if (existsSync(absolute)) {
+      targetReal = realpathSync(absolute)
     } else {
-      targetReal = absolute
+      const tail: string[] = []
+      let cursor = absolute
+      while (!existsSync(cursor)) {
+        const parent = dirname(cursor)
+        if (parent === cursor) return null
+        tail.unshift(basename(cursor))
+        cursor = parent
+      }
+      targetReal = resolve(realpathSync(cursor), ...tail)
     }
+  } catch {
+    return null
   }
-
-  if (targetReal !== vaultReal && !targetReal.startsWith(vaultReal + sep)) {
-    throw new Error(
-      `Path rejected (escapes vault): ${userPath}`
-    )
-  }
+  if (targetReal !== rootReal && !targetReal.startsWith(rootReal + sep)) return null
   return targetReal
 }
 
-/**
- * Same as `assertInsideVault` but returns null instead of throwing,
- * for handlers that already swallow errors and return false/null on
- * failure. Keeps the existing handler return shapes intact.
- */
+/** The open vault's root (always a realpath once `vault:open` ran). */
+export function currentVaultRoot(): string | null {
+  return mainStore.getState().settings.vaultPath
+}
+
+/** Confine a renderer-supplied path to the open vault or throw. */
+export function assertInsideVault(userPath: string): string {
+  const root = currentVaultRoot()
+  if (!root) throw new Error('No vault is open')
+  const resolved = resolveInsideRoot(userPath, root)
+  if (!resolved) throw new Error(`Path is outside the vault: ${userPath}`)
+  return resolved
+}
+
+/** Same as `assertInsideVault` but returns null instead of throwing. */
 export function safeInsideVault(userPath: string): string | null {
   try {
     return assertInsideVault(userPath)
@@ -58,18 +63,14 @@ export function safeInsideVault(userPath: string): string | null {
 }
 
 /**
- * Allowlist for URLs we're willing to hand to shell.openExternal.
- * Rejects file://, javascript:, custom app schemes, smb://, etc. —
- * all of which can be abused to exfiltrate data or launch apps.
+ * Allowlist for URLs handed to `shell.openExternal`. Rejects file://,
+ * javascript:, custom app schemes, smb://, etc. — all of which can be
+ * abused to exfiltrate data or launch applications.
  */
 export function isSafeExternalUrl(urlStr: string): boolean {
   try {
     const url = new URL(urlStr)
-    return (
-      url.protocol === 'http:' ||
-      url.protocol === 'https:' ||
-      url.protocol === 'mailto:'
-    )
+    return url.protocol === 'http:' || url.protocol === 'https:' || url.protocol === 'mailto:'
   } catch {
     return false
   }

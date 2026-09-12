@@ -1,80 +1,156 @@
-import { app, shell, BrowserWindow, protocol, net } from 'electron'
+import { app, shell, BrowserWindow, protocol, net, screen, session } from 'electron'
 import { join, resolve, sep } from 'path'
 import { pathToFileURL } from 'url'
+import { realpathSync } from 'fs'
 import { registerIPCHandlers } from './ipc/handlers'
 import { mainStore } from './store'
-import { settingsService } from './services/settings-service'
+import { settingsService, type WindowBounds } from './services/settings-service'
 import { isSafeExternalUrl } from './services/path-guard'
+import {
+  APP_HOST,
+  APP_SCHEME,
+  MEDIA_FOLDER_NAME,
+  MEDIA_HOST,
+  MEDIA_SCHEME
+} from '@shared/constants'
 
-// Icon used for the BrowserWindow in dev. In packaged builds,
-// electron-builder uses build/icon.png to generate .icns/.ico.
-const APP_ICON = join(__dirname, '../../build/icon.png')
+const RENDERER_DIR = resolve(__dirname, '../renderer')
+const APP_ORIGIN = `${APP_SCHEME}://${APP_HOST}`
+const APP_INDEX_URL = `${APP_ORIGIN}/index.html`
+// Only used in development: packaged builds ship the icon via electron-builder.
+const DEV_ICON = join(__dirname, '../../build/icon.png')
 
-// Register custom scheme before app is ready so the renderer treats
-// vault-media:// URLs as secure/standard and can load images from them.
+// Both schemes must be registered before app.whenReady(). `app://` serves
+// the packaged renderer so the page has a real origin (file:// pages all
+// share the opaque "null" origin, which defeats any origin-based
+// navigation check). `vault-media://` streams attachments from the vault.
 protocol.registerSchemesAsPrivileged([
   {
-    scheme: 'vault-media',
-    privileges: {
-      standard: true,
-      secure: true,
-      supportFetchAPI: true,
-      stream: true,
-      bypassCSP: true
-    }
+    scheme: APP_SCHEME,
+    privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true }
+  },
+  {
+    scheme: MEDIA_SCHEME,
+    privileges: { standard: true, secure: true, stream: true }
   }
 ])
 
-// Single instance lock - prevent multiple windows
 const gotTheLock = app.requestSingleInstanceLock()
-
 if (!gotTheLock) {
+  console.error('Another instance of Rune is already running — quitting.')
   app.quit()
 }
 
-function createWindow(): void {
-  // Check if we're in development mode (must be called after app is ready)
-  const isDev = !app.isPackaged
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection in main:', reason)
+})
 
-  const savedBounds = settingsService.loadWindowBounds()
+function fileResponse(absolutePath: string): Promise<Response> {
+  return net.fetch(pathToFileURL(absolutePath).toString())
+}
+
+function forbidden(): Response {
+  return new Response('Forbidden', { status: 403 })
+}
+
+// Serve out/renderer/* at app://rune/*, confined to that directory.
+// frame-ancestors is only honoured in a header, so the full policy is
+// attached here; index.html carries the same policy in a <meta> for dev.
+const APP_CSP =
+  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+  "img-src 'self' data: vault-media:; object-src 'none'; base-uri 'self'; " +
+  "form-action 'none'; frame-ancestors 'none'"
+
+async function handleAppRequest(request: Request): Promise<Response> {
+  const url = new URL(request.url)
+  let pathname = url.pathname
+  try {
+    pathname = decodeURIComponent(pathname)
+  } catch {
+    return new Response('Bad request', { status: 400 })
+  }
+  if (pathname === '/' || pathname === '') pathname = '/index.html'
+  const absolute = resolve(RENDERER_DIR, `.${pathname}`)
+  if (!absolute.startsWith(RENDERER_DIR + sep)) return forbidden()
+  const response = await fileResponse(absolute)
+  if (!pathname.endsWith('.html')) return response
+  const headers = new Headers(response.headers)
+  headers.set('Content-Security-Policy', APP_CSP)
+  return new Response(response.body, { status: response.status, headers })
+}
+
+// Serve {vault}/vault_media/* at vault-media://local/*. Percent-encoded
+// `..` survives URL normalisation, so the decoded path is re-resolved and
+// realpath'd before anything is read.
+function handleMediaRequest(request: Request): Promise<Response> | Response {
+  const vaultPath = mainStore.getState().settings.vaultPath
+  if (!vaultPath) return new Response('No vault open', { status: 404 })
+  const mediaRoot = resolve(vaultPath, MEDIA_FOLDER_NAME)
+  const url = new URL(request.url)
+  if (url.host !== MEDIA_HOST) return forbidden()
+  let relative: string
+  try {
+    relative = decodeURIComponent(url.pathname.replace(/^\//, ''))
+  } catch {
+    return new Response('Bad request', { status: 400 })
+  }
+  const absolute = resolve(mediaRoot, relative)
+  if (!absolute.startsWith(mediaRoot + sep)) return forbidden()
+  let real: string
+  try {
+    real = realpathSync(absolute)
+  } catch {
+    return new Response('Not found', { status: 404 })
+  }
+  if (!real.startsWith(mediaRoot + sep)) return forbidden()
+  return fileResponse(real)
+}
+
+// Drop remembered coordinates that no longer fall on a connected display
+// (external monitor unplugged) so the window can never open off-screen.
+function visibleBounds(saved: WindowBounds): WindowBounds {
+  if (saved.x === undefined || saved.y === undefined) return saved
+  const { x, y, width, height } = saved
+  const onSomeDisplay = screen.getAllDisplays().some(({ workArea }) => {
+    return (
+      x + width > workArea.x + 50 &&
+      x < workArea.x + workArea.width - 50 &&
+      y >= workArea.y - 20 &&
+      y < workArea.y + workArea.height - 50
+    )
+  })
+  return onSomeDisplay ? saved : { width, height }
+}
+
+function createWindow(): void {
+  const devServerUrl = !app.isPackaged ? process.env['ELECTRON_RENDERER_URL'] : undefined
+  const bounds = visibleBounds(settingsService.loadWindowBounds())
 
   const mainWindow = new BrowserWindow({
-    width: savedBounds.width,
-    height: savedBounds.height,
-    x: savedBounds.x,
-    y: savedBounds.y,
+    ...bounds,
     minWidth: 900,
     minHeight: 600,
     show: false,
     title: 'Rune',
-    icon: APP_ICON,
+    icon: app.isPackaged ? undefined : DEV_ICON,
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 16, y: 16 },
     backgroundColor: '#0f0f0f',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      // Chromium OS-level sandbox for the renderer. Our preload only
-      // uses contextBridge, ipcRenderer, and webUtils — all
-      // sandbox-compatible — so this can stay on for an extra layer of
-      // renderer isolation beyond contextIsolation + nodeIntegration.
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
-      // Block <webview> tags which bypass most renderer lockdown.
       webviewTag: false
     }
   })
 
-  mainWindow.on('ready-to-show', () => {
-    mainWindow.show()
-  })
+  mainWindow.on('ready-to-show', () => mainWindow.show())
 
   // Persist window bounds on resize/move (debounced) and on close.
-  // Debounce avoids hammering the disk while the user drags.
   let saveTimer: ReturnType<typeof setTimeout> | undefined
   const persistBounds = (): void => {
-    if (mainWindow.isDestroyed()) return
-    if (mainWindow.isMinimized() || mainWindow.isFullScreen()) return
+    if (mainWindow.isDestroyed() || mainWindow.isMinimized() || mainWindow.isFullScreen()) return
     const { width, height, x, y } = mainWindow.getBounds()
     settingsService.saveWindowBounds({ width, height, x, y })
   }
@@ -89,113 +165,77 @@ function createWindow(): void {
     persistBounds()
   })
 
-  // Only forward http(s)/mailto to the default browser. Other schemes
-  // (file://, custom app schemes, javascript:, etc.) can be abused to
-  // launch unexpected applications or exfiltrate data.
-  mainWindow.webContents.setWindowOpenHandler((details) => {
-    if (isSafeExternalUrl(details.url)) {
-      shell.openExternal(details.url)
-    }
+  // Links never open in-app: http(s)/mailto go to the default browser,
+  // everything else is dropped.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (isSafeExternalUrl(url)) void shell.openExternal(url)
     return { action: 'deny' }
   })
 
-  // Block any top-level navigation away from the loaded bundle. If
-  // something in the renderer sets `location.href = 'https://evil'`
-  // we intercept and offload to the default browser instead.
-  // Same-origin SPA navigation (hash/route churn) is allowed.
+  // The only navigation the window may perform is to its own bundle.
+  const isOwnUrl = (url: string): boolean => {
+    if (devServerUrl) {
+      try {
+        return new URL(url).origin === new URL(devServerUrl).origin
+      } catch {
+        return false
+      }
+    }
+    const bare = url.split('#')[0].split('?')[0]
+    return bare === APP_INDEX_URL || bare === `${APP_ORIGIN}/`
+  }
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    try {
-      const current = mainWindow.webContents.getURL()
-      // The very first load happens before getURL() returns anything,
-      // so fall through (allow) when we haven't loaded the bundle yet.
-      if (!current) return
-      const currentOrigin = new URL(current).origin
-      const targetOrigin = new URL(url).origin
-      if (currentOrigin === targetOrigin) return
-    } catch {
-      // URL parsing failed — fall through to block.
-    }
+    if (isOwnUrl(url)) return
     event.preventDefault()
-    if (isSafeExternalUrl(url)) {
-      shell.openExternal(url)
-    }
+    if (isSafeExternalUrl(url)) void shell.openExternal(url)
   })
 
-  // HMR for renderer based on electron-vite cli.
-  // Load the remote URL for development or the local html file for production.
-  if (isDev && process.env['ELECTRON_RENDERER_URL']) {
-    mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+  if (devServerUrl) {
+    void mainWindow.loadURL(devServerUrl)
   } else {
-    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    void mainWindow.loadURL(APP_INDEX_URL)
   }
-
-  // DevTools available via Cmd+Option+I in development.
-  // Auto-open disabled to avoid Chromium's Autofill.enable console noise.
 }
 
-// Focus existing window when second instance is launched
 app.on('second-instance', () => {
-  const windows = BrowserWindow.getAllWindows()
-  if (windows.length > 0) {
-    const mainWindow = windows[0]
+  const [mainWindow] = BrowserWindow.getAllWindows()
+  if (mainWindow) {
     if (mainWindow.isMinimized()) mainWindow.restore()
     mainWindow.focus()
   }
 })
 
-// This method will be called when Electron has finished
-// initialization and is ready to create browser windows.
-app.whenReady().then(() => {
-  // Set app user model id for Windows taskbar grouping
+app.on('web-contents-created', (_, contents) => {
+  contents.on('will-attach-webview', (event) => event.preventDefault())
+})
+
+void app.whenReady().then(() => {
   app.setAppUserModelId('com.rune.app')
-  // Ensure the dock icon in dev matches the packaged icon (macOS only).
-  if (process.platform === 'darwin' && app.dock) {
+  if (!app.isPackaged && process.platform === 'darwin' && app.dock) {
     try {
-      app.dock.setIcon(APP_ICON)
+      app.dock.setIcon(DEV_ICON)
     } catch {
       /* best-effort */
     }
   }
 
-  // Resolve vault-media:// requests to files inside the current vault's
-  // vault_media/ folder. The hostname is a placeholder (we always use
-  // "local"); the actual relative path lives in url.pathname.
-  //
-  // SECURITY: percent-encoded `..` segments (e.g. "%2F..%2F..%2F") survive
-  // WHATWG URL normalization, so after decodeURIComponent we MUST
-  // re-resolve and verify the result is still inside vault_media/.
-  // Without this check, a crafted image URL in a markdown file can
-  // read any file on disk.
-  protocol.handle('vault-media', (request) => {
-    const vaultPath = mainStore.getState().settings.vaultPath
-    if (!vaultPath) {
-      return new Response('No vault open', { status: 404 })
-    }
-    const mediaRoot = resolve(vaultPath, 'vault_media')
-    const url = new URL(request.url)
-    const relative = decodeURIComponent(url.pathname.replace(/^\//, ''))
-    const absolute = resolve(mediaRoot, relative)
-    if (absolute !== mediaRoot && !absolute.startsWith(mediaRoot + sep)) {
-      return new Response('Forbidden', { status: 403 })
-    }
-    return net.fetch(pathToFileURL(absolute).toString())
-  })
+  // The renderer never needs camera, microphone, location, or notifications.
+  session.defaultSession.setPermissionRequestHandler((_wc, _permission, callback) =>
+    callback(false)
+  )
+  session.defaultSession.setPermissionCheckHandler(() => false)
 
-  // Register IPC handlers
+  protocol.handle(APP_SCHEME, handleAppRequest)
+  protocol.handle(MEDIA_SCHEME, handleMediaRequest)
+
   registerIPCHandlers()
-
   createWindow()
 
-  app.on('activate', function () {
-    // On macOS it's common to re-create a window in the app when the
-    // dock icon is clicked and there are no other windows open.
+  app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
 })
 
-// Quit when all windows are closed, except on macOS.
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit()
-  }
+  if (process.platform !== 'darwin') app.quit()
 })

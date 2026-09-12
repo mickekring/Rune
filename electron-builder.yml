@@ -2,26 +2,45 @@ appId: com.rune.app
 productName: Rune
 directories:
   buildResources: build
+# Positive allowlist: only the compiled bundles and package.json ship.
+# Production node_modules are added by electron-builder automatically.
+# (A negative-only list previously packed CLAUDE.md, docs/, tasks/ and
+# .claude/settings.local.json into app.asar.)
 files:
-  - '!**/.vscode/*'
-  - '!src/*'
-  - '!electron.vite.config.{js,ts,mjs,cjs}'
-  - '!{.eslintignore,.eslintrc.cjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
-  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
-  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
-asarUnpack:
-  - resources/**
+  - out/**
+  - package.json
+# Electron fuses harden the packaged binary: it can no longer be used as a
+# generic Node interpreter (ELECTRON_RUN_AS_NODE), NODE_OPTIONS and
+# --inspect are ignored, and app.asar is integrity-checked and the only
+# place code loads from. The renderer is served over app:// rather than
+# file://, so the file-protocol privileges are not needed either.
+electronFuses:
+  runAsNode: false
+  enableCookieEncryption: true
+  enableNodeOptionsEnvironmentVariable: false
+  enableNodeCliInspectArguments: false
+  enableEmbeddedAsarIntegrityValidation: true
+  onlyLoadAppFromAsar: true
+  grantFileProtocolExtraPrivileges: false
+  resetAdHocDarwinSignature: true
 mac:
+  entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.plist
   extendInfo:
-    # Rune reads/writes files inside a user-chosen vault folder and
-    # copies dragged attachments. Documents/Downloads usage descriptions
-    # surface TCC prompts on first access. We do NOT use camera/mic,
-    # so those entitlements are intentionally omitted — fewer declared
-    # capabilities = less of an attack surface and smoother App Store
-    # review if that ever happens.
-    - NSDocumentsFolderUsageDescription: Rune reads and writes your markdown notes inside the vault folder you select.
-    - NSDownloadsFolderUsageDescription: Rune lets you drop files from Downloads into a note as attachments.
+    # Rune reads/writes files inside a user-chosen vault folder and copies
+    # dragged attachments. These strings surface in the TCC prompts.
+    NSDocumentsFolderUsageDescription: Rune reads and writes your markdown notes inside the vault folder you select.
+    NSDownloadsFolderUsageDescription: Rune lets you drop files from Downloads into a note as attachments.
+    # electron-builder adds default camera/microphone/Bluetooth strings;
+    # Rune uses none of them, so make the descriptions say so.
+    NSCameraUsageDescription: Rune does not use the camera.
+    NSMicrophoneUsageDescription: Rune does not use the microphone.
+    NSBluetoothAlwaysUsageDescription: Rune does not use Bluetooth.
+    NSBluetoothPeripheralUsageDescription: Rune does not use Bluetooth.
+    NSAudioCaptureUsageDescription: Rune does not capture audio.
+  # Set notarize to true (with APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD /
+  # APPLE_TEAM_ID in the environment) and sign with a Developer ID
+  # identity before distributing to other Macs.
   notarize: false
   target:
     - target: dmg
@@ -45,11 +64,10 @@ linux:
     - target: AppImage
       arch:
         - x64
-  maintainer: electronjs.org
+  maintainer: Micke Kring
   category: Utility
 appImage:
   artifactName: ${name}-${version}.${ext}
 npmRebuild: false
-# No publish provider configured. Auto-updates would require a real
-# update server URL AND properly-signed builds; enabling this with a
-# placeholder URL is a supply-chain hazard waiting to happen.
+# No auto-update: nothing is published and no update server is configured.
+publish: null

@@ -3,22 +3,27 @@ import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
-export default defineConfig({
-  main: {
-    plugins: [externalizeDepsPlugin()],
-    resolve: {
-      alias: {
-        '@shared': resolve('src/shared')
-      }
+// electron-vite leaves `minify` off by default; the packaged renderer was
+// shipping 2.2 MB of readable JavaScript instead of ~1 MB minified.
+const shared = {
+  resolve: {
+    alias: {
+      '@shared': resolve('src/shared')
     }
   },
+  build: {
+    minify: 'esbuild' as const
+  }
+}
+
+export default defineConfig({
+  main: {
+    ...shared,
+    plugins: [externalizeDepsPlugin()]
+  },
   preload: {
-    plugins: [externalizeDepsPlugin()],
-    resolve: {
-      alias: {
-        '@shared': resolve('src/shared')
-      }
-    }
+    ...shared,
+    plugins: [externalizeDepsPlugin()]
   },
   renderer: {
     resolve: {
@@ -26,6 +31,9 @@ export default defineConfig({
         '@': resolve('src/renderer/src'),
         '@shared': resolve('src/shared')
       }
+    },
+    build: {
+      minify: 'esbuild'
     },
     plugins: [react(), tailwindcss()]
   }

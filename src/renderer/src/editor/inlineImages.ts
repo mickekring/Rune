@@ -8,33 +8,31 @@ import {
   WidgetType
 } from '@codemirror/view'
 import { syntaxTree } from '@codemirror/language'
+import { MEDIA_FOLDER_NAME, MEDIA_HOST, MEDIA_SCHEME } from '@shared/constants'
 
-// Resolve a markdown image src to something the renderer can actually load.
-// - vault-relative paths like "vault_media/foo.png" -> "vault-media://..."
-// - absolute http(s) URLs are returned unchanged
-// - everything else is treated as not-loadable (returns null)
+// Resolve a markdown image src to something the renderer can load:
+// vault-relative "vault_media/foo.png" becomes a vault-media:// URL and
+// data: URIs pass through. Remote http(s) images are blocked by the CSP
+// (no tracking pixels from synced notes), so they are not resolved.
 function resolveImageSrc(raw: string): string | null {
   const trimmed = raw.trim()
   if (!trimmed) return null
-  if (/^https?:\/\//i.test(trimmed) || /^data:/i.test(trimmed)) return trimmed
+  if (/^data:image\//i.test(trimmed)) return trimmed
 
-  // Accept both encoded (vault_media/foo%20bar.png) and raw
-  // (vault_media/foo bar.png) forms. Decode first to normalize, then
-  // re-encode per-segment for the vault-media:// URL.
   let decoded = trimmed
   try {
     decoded = decodeURI(trimmed)
   } catch {
     /* leave as-is */
   }
-  const prefix = 'vault_media/'
+  const prefix = `${MEDIA_FOLDER_NAME}/`
   if (!decoded.startsWith(prefix)) return null
-  const rest = decoded.slice(prefix.length)
-  const reencoded = rest
+  const reencoded = decoded
+    .slice(prefix.length)
     .split('/')
     .map((segment) => encodeURIComponent(segment))
     .join('/')
-  return `vault-media://local/${reencoded}`
+  return `${MEDIA_SCHEME}://${MEDIA_HOST}/${reencoded}`
 }
 
 class ImageWidget extends WidgetType {
@@ -47,11 +45,7 @@ class ImageWidget extends WidgetType {
   }
 
   eq(other: ImageWidget): boolean {
-    return (
-      other.src === this.src &&
-      other.alt === this.alt &&
-      other.rawPath === this.rawPath
-    )
+    return other.src === this.src && other.alt === this.alt && other.rawPath === this.rawPath
   }
 
   toDOM(): HTMLElement {
@@ -82,28 +76,17 @@ function buildDecorations(view: EditorView): DecorationSet {
       to,
       enter(node) {
         if (node.name !== 'Image') return
-
-        // Keep the raw markdown visible while the caret is inside the image
+        // Keep the raw markdown visible while the caret is inside the image.
         if (sel.from <= node.to && sel.to >= node.from) return
 
         const text = state.doc.sliceString(node.from, node.to)
-        // Expect ![alt](src) — pull alt + src by index
         const altStart = text.indexOf('[')
         const altEnd = text.indexOf(']', altStart)
         const srcStart = text.indexOf('(', altEnd)
         const srcEnd = text.lastIndexOf(')')
-        if (
-          altStart < 0 ||
-          altEnd < 0 ||
-          srcStart < 0 ||
-          srcEnd < 0 ||
-          srcEnd <= srcStart
-        ) {
-          return
-        }
+        if (altStart < 0 || altEnd < 0 || srcStart < 0 || srcEnd < 0 || srcEnd <= srcStart) return
 
         const alt = text.slice(altStart + 1, altEnd)
-        // Strip optional "title" after the URL
         const inside = text.slice(srcStart + 1, srcEnd).trim()
         const spaceIdx = inside.search(/\s/)
         const rawSrc = spaceIdx >= 0 ? inside.slice(0, spaceIdx) : inside
@@ -113,10 +96,7 @@ function buildDecorations(view: EditorView): DecorationSet {
         builder.add(
           node.from,
           node.to,
-          Decoration.replace({
-            widget: new ImageWidget(resolved, alt, rawSrc),
-            block: false
-          })
+          Decoration.replace({ widget: new ImageWidget(resolved, alt, rawSrc), block: false })
         )
       }
     })
@@ -134,16 +114,10 @@ export const inlineImages = ViewPlugin.fromClass(
     }
 
     update(update: ViewUpdate) {
-      if (
-        update.docChanged ||
-        update.selectionSet ||
-        update.viewportChanged
-      ) {
+      if (update.docChanged || update.selectionSet || update.viewportChanged) {
         this.decorations = buildDecorations(update.view)
       }
     }
   },
-  {
-    decorations: (v) => v.decorations
-  }
+  { decorations: (v) => v.decorations }
 )

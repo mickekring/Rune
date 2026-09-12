@@ -40,3 +40,8 @@ export interface TagGraph {
   nodes: TagGraphNode[]
   edges: TagGraphEdge[]
 }
+
+export interface RemoveTagResult {
+  filesModified: string[]
+  occurrencesRemoved: number
+}
