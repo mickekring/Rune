@@ -6,6 +6,7 @@ _None open. The "last character not saved when switching files" issue (on hold s
 
 ## In progress / decisions pending
 
+- **Platform (decided 2026-09-12)** — Rune stays on Electron and targets macOS only. A Swift port was weighed (native text system, memory, app size, fewer runtime advisories) against rebuilding the CodeMirror live-preview editor and everything around it; the cost was judged too high for a working single-user tool. Revisit only if native text integration becomes the goal, and then start with a TextKit 2 editor spike.
 - **Distribution signing** — builds are signed with an Apple Development identity and not notarized, so other Macs reject the DMG. Needs a Developer ID certificate and `notarize: true` with credentials in the environment.
 - **App id** — `com.rune.app` is not a domain we control. Changing it resets TCC grants and the single-instance identity, so decide before a public release.
 - **Major dependency upgrades** — Electron 44, Vite 8 (needs electron-vite support), TypeScript 7, ESLint 10 are available but were not taken in the audit pass. Bump deliberately, one at a time.
